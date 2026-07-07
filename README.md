@@ -16,7 +16,7 @@
 
 **💎 GRAM / 💵 USDT (TON):** `UQAO3u5d0PU3RQLMSw0I5LeyWdVMUf1rDflMful3ac1p8kS1`
 
-> Способ поддержки появится немного позже ❤️
+> Всем спасибо за поддержку ❤️
 
 ---
 
