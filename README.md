@@ -1,6 +1,6 @@
 # ⚡Zapret Kmestu
 
-**Zapret Kmestu** —  графическая оболочка для Windows, которая помогает установить, настроить и запускать `zapret` без ручной работы с файлами, скриптами и командной строкой. Программа восстанавливает работу `YouTube` и `Discord` (не VPN).
+**Zapret Kmestu** —  программа, которая восстанавливает работу `YouTube` и `Discord` (не VPN). Это графическая оболочка для Windows, которая помогает установить, настроить и запускать `zapret` без ручной работы с файлами, скриптами и командной строкой. Интуитивно понятный интерфейс, с которым справится юезр любого возраста.
 
 <a href="https://github.com/kmestu/ZapretKmestu/releases/latest">
   <img src="docs/assets/download-banner.webp" alt="Скачать Zapret Kmestu">
@@ -86,7 +86,7 @@
 
 ## 🙏 Благодарности
 
-Проект был бы невозможен без работы авторов и участников:
+Проект был бы невозможен без работы этих авторов:
 - [Flowseal](https://github.com/Flowseal) — за проект `zapret-discord-youtube`.
 - [bol-van](https://github.com/bol-van) — за оригинальный движок `zapret`.
 
