@@ -1,0 +1,73 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio / IDE
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Rider / JetBrains
+.idea/
+
+# Test output
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+
+# Publish / release artifacts
+release/
+portable/
+*.zip
+
+# Logs and local temporary files
+*.log
+*.tmp
+*.bak
+
+# Zapret Kmestu recovery/temp files
+restored_xaml*
+*.broken-backup
+*.corrupted-*
+*.before-restore-*
+lines.txt
+
+# Accidental root-level build outputs
+/*.dll
+/*.exe
+/*.pdb
+/*.deps.json
+/*.runtimeconfig.json
+/cs/
+/de/
+/es/
+/fr/
+/it/
+/ja/
+/ko/
+/pl/
+/pt-BR/
+/ru/
+/tr/
+/zh-Hans/
+/zh-Hant/
+# Flowseal user custom lists
+research/flowseal/extracted/lists/*-user.txt
+
+# Additional release and publication artifacts
+*.7z
+*.rar
+publish/
+SHA256SUMS.txt
+
+# Settings and user local data
+settings.json
+last_autopick.json
+app.log
+
+# Flowseal research artifacts
+research/flowseal/downloads/
+research/flowseal/extracted/
