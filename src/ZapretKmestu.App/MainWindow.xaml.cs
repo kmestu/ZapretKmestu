@@ -181,6 +181,8 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        AppVersionBadgeText.Text = GetDynamicAppDisplayVersion();
+        _ = RunPostUpdateMigrationAsync();
         DiagAutoRefreshText.Text = $"Автоматическое обновление графиков — каждые {AutoCheckIntervalSeconds} секунд";
 
         // Initialize installer services
@@ -1533,10 +1535,21 @@ public partial class MainWindow : Window
 
         if (parts.Length > 1)
         {
-            return $"{versionPart}-{parts[1]}";
+            return $"{versionPart}-{parts[1]}".ToLowerInvariant();
         }
 
-        return versionPart;
+        return versionPart.ToLowerInvariant();
+    }
+
+    private string GetDynamicAppDisplayVersion()
+    {
+        var attr = System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(System.Reflection.Assembly.GetExecutingAssembly());
+        string raw = attr?.InformationalVersion ?? "";
+        if (string.IsNullOrWhiteSpace(raw)) return "v—";
+        string norm = NormalizeVersion(raw);
+        var parts = norm.Split(new[] { '-' }, 2);
+        if (parts.Length > 1) return $"v{parts[0]} {parts[1]}";
+        return $"v{parts[0]}";
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1703,7 +1716,7 @@ public partial class MainWindow : Window
             items.Add(new AppUpdateItem
             {
                 Name        = "Kmestu",
-                Version     = _latestKmestuRelease ?? "v0.2 beta",
+                Version     = _latestKmestuRelease ?? GetDynamicAppDisplayVersion(),
                 Description = "Обновление программы"
             });
         }
@@ -4641,6 +4654,220 @@ public partial class MainWindow : Window
     /// On any failure the application keeps running and shows a status message.
     /// No MessageBox is shown at any point.
     /// </summary>
+    private class ReleaseManifestFile
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("path")]
+        public string Path { get; set; } = "";
+        [System.Text.Json.Serialization.JsonPropertyName("size")]
+        public long Size { get; set; }
+        [System.Text.Json.Serialization.JsonPropertyName("sha256")]
+        public string Sha256 { get; set; } = "";
+    }
+
+    private class ReleaseManifest
+    {
+        [System.Text.Json.Serialization.JsonPropertyName("schemaVersion")]
+        public int SchemaVersion { get; set; }
+        [System.Text.Json.Serialization.JsonPropertyName("applicationVersion")]
+        public string ApplicationVersion { get; set; } = "";
+        [System.Text.Json.Serialization.JsonPropertyName("files")]
+        public List<ReleaseManifestFile> Files { get; set; } = new();
+    }
+
+    private bool ValidateManifestPath(string packageRoot, string relPath, out string absolutePath)
+    {
+        absolutePath = "";
+        if (string.IsNullOrWhiteSpace(relPath)) return false;
+        if (relPath.Contains("..") || Path.IsPathRooted(relPath)) return false;
+        string combined = Path.GetFullPath(Path.Combine(packageRoot, relPath.Replace("/", "\\")));
+        if (!combined.StartsWith(packageRoot, StringComparison.OrdinalIgnoreCase)) return false;
+        absolutePath = combined;
+        return true;
+    }
+
+    private string ComputeSha256(string path)
+    {
+        using var sha256 = System.Security.Cryptography.SHA256.Create();
+        using var stream = File.OpenRead(path);
+        var hash = sha256.ComputeHash(stream);
+        return BitConverter.ToString(hash).Replace("-", "").ToUpperInvariant();
+    }
+
+    private bool ValidateReleaseManifest(string packageRoot, ReleaseManifest manifest, bool isPreUpdate)
+    {
+        if (manifest.SchemaVersion != 1) { AppLogger.Error("Manifest schemaVersion invalid."); return false; }
+        if (string.IsNullOrWhiteSpace(manifest.ApplicationVersion)) { AppLogger.Error("Manifest applicationVersion missing."); return false; }
+
+        var required = isPreUpdate ? new[] { "ZapretKmestu.exe", "ZapretKmestu.Updater.exe", "README_RELEASE.txt", "Engine/zapret-flowseal-1.9.9d-bundled.zip" }
+                                   : new[] { "ZapretKmestu.Updater.exe", "Engine/zapret-flowseal-1.9.9d-bundled.zip" };
+        var foundPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var req in required)
+        {
+            var entry = manifest.Files.FirstOrDefault(f => string.Equals(f.Path.Replace("\\", "/"), req, StringComparison.OrdinalIgnoreCase));
+            if (entry == null) { AppLogger.Error($"Manifest missing required file: {req}"); return false; }
+        }
+
+        foreach (var file in manifest.Files)
+        {
+            if (!ValidateManifestPath(packageRoot, file.Path, out string absPath))
+            {
+                AppLogger.Error($"Manifest invalid path: {file.Path}");
+                return false;
+            }
+            if (!foundPaths.Add(absPath))
+            {
+                AppLogger.Error($"Manifest duplicate path: {file.Path}");
+                return false;
+            }
+
+            if (!File.Exists(absPath))
+            {
+                if (!isPreUpdate && string.Equals(file.Path.Replace("\\", "/"), "ZapretKmestu.exe", StringComparison.OrdinalIgnoreCase)) continue; // Allowed missing post-update
+                if (!isPreUpdate && string.Equals(file.Path.Replace("\\", "/"), "README_RELEASE.txt", StringComparison.OrdinalIgnoreCase)) continue;
+                AppLogger.Error($"Manifest file missing on disk: {absPath}");
+                return false;
+            }
+
+            var info = new FileInfo(absPath);
+            if (info.Length != file.Size)
+            {
+                AppLogger.Error($"Manifest size mismatch for {file.Path}. Expected {file.Size}, got {info.Length}");
+                return false;
+            }
+
+            string actualSha = ComputeSha256(absPath);
+            if (!string.Equals(actualSha, file.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                AppLogger.Error($"Manifest SHA-256 mismatch for {file.Path}");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static int _migrationRunCount = 0;
+    private async Task RunPostUpdateMigrationAsync()
+    {
+        if (System.Threading.Interlocked.Exchange(ref _migrationRunCount, 1) != 0) return;
+
+        await Task.Delay(1000).ConfigureAwait(false); // Brief wait
+
+        try
+        {
+            string currentVersion = NormalizeVersion(System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(System.Reflection.Assembly.GetExecutingAssembly())?.InformationalVersion ?? "");
+            string appUpdateRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Zapret Kmestu", "Temp", "AppUpdate");
+            if (!Directory.Exists(appUpdateRoot)) return;
+
+            string targetBase = AppContext.BaseDirectory;
+            var manifests = Directory.GetFiles(appUpdateRoot, "release-manifest.json", SearchOption.AllDirectories);
+            foreach (var manifestPath in manifests)
+            {
+                string packageRoot = Path.GetFullPath(Path.GetDirectoryName(manifestPath)!);
+                if (!packageRoot.StartsWith(appUpdateRoot, StringComparison.OrdinalIgnoreCase)) continue;
+
+                ReleaseManifest? manifest = null;
+                try { manifest = System.Text.Json.JsonSerializer.Deserialize<ReleaseManifest>(File.ReadAllText(manifestPath)); } catch { continue; }
+                if (manifest == null) continue;
+
+                if (!string.Equals(NormalizeVersion(manifest.ApplicationVersion), currentVersion, StringComparison.OrdinalIgnoreCase)) continue;
+
+                if (!ValidateReleaseManifest(packageRoot, manifest, isPreUpdate: false))
+                {
+                    AppLogger.Error("Post-update migration manifest validation failed.");
+                    continue;
+                }
+
+                AppLogger.Info("Post-update migration found matching package payload.");
+                var requiredFiles = new[] { "ZapretKmestu.Updater.exe", "Engine/zapret-flowseal-1.9.9d-bundled.zip" };
+
+                bool success = true;
+                foreach (var req in requiredFiles)
+                {
+                    var entry = manifest.Files.First(f => string.Equals(f.Path.Replace("\\", "/"), req, StringComparison.OrdinalIgnoreCase));
+                    ValidateManifestPath(packageRoot, entry.Path, out string sourceAbs);
+
+                    string destPath = Path.GetFullPath(Path.Combine(targetBase, entry.Path.Replace("/", "\\")));
+                    if (!destPath.StartsWith(targetBase, StringComparison.OrdinalIgnoreCase)) { success = false; break; }
+
+                    if (File.Exists(destPath))
+                    {
+                        if (string.Equals(ComputeSha256(destPath), entry.Sha256, StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue; // skip matching
+                        }
+                    }
+
+                    Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+                    string tmpPath = destPath + $".{Guid.NewGuid():N}.tmp";
+                    string backupPath = destPath + $".{Guid.NewGuid():N}.migration.backup";
+
+                    bool copied = false;
+                    for (int retry = 0; retry < 20; retry++) // max 10s total (20 * 500ms)
+                    {
+                        try
+                        {
+                            File.Copy(sourceAbs, tmpPath, true);
+                            var fInfo = new FileInfo(tmpPath);
+                            if (fInfo.Length == entry.Size && string.Equals(ComputeSha256(tmpPath), entry.Sha256, StringComparison.OrdinalIgnoreCase))
+                            {
+                                copied = true;
+                                break;
+                            }
+                        }
+                        catch (Exception) { /* transient */ }
+
+                        if (File.Exists(tmpPath)) try { File.Delete(tmpPath); } catch {}
+                        AppLogger.Info($"[Migration] Retrying copy for {destPath}...");
+                        await Task.Delay(500).ConfigureAwait(false);
+                    }
+
+                    if (!copied)
+                    {
+                        AppLogger.Error($"Failed to securely copy {entry.Path}");
+                        success = false;
+                        if (File.Exists(tmpPath)) try { File.Delete(tmpPath); } catch {}
+                        break; // Stop migration
+                    }
+
+                    try
+                    {
+                        if (File.Exists(destPath)) File.Move(destPath, backupPath);
+                        File.Move(tmpPath, destPath);
+                        if (!string.Equals(ComputeSha256(destPath), entry.Sha256, StringComparison.OrdinalIgnoreCase))
+                        {
+                            AppLogger.Error($"Destination hash mismatch for {destPath} after move. Rolling back.");
+                            if (File.Exists(destPath)) File.Delete(destPath);
+                            if (File.Exists(backupPath)) File.Move(backupPath, destPath);
+                            success = false;
+                            break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLogger.Error($"Atomic replacement failed for {destPath}: {ex.Message}");
+                        if (File.Exists(destPath) && new FileInfo(destPath).Length == 0) try { File.Delete(destPath); } catch {}
+                        if (!File.Exists(destPath) && File.Exists(backupPath)) try { File.Move(backupPath, destPath); } catch {}
+                        success = false;
+                        if (File.Exists(tmpPath)) try { File.Delete(tmpPath); } catch {}
+                        break;
+                    }
+                    if (File.Exists(tmpPath)) try { File.Delete(tmpPath); } catch {}
+                }
+
+                if (success)
+                {
+                    AppLogger.Info("Post-update migration completed successfully.");
+                }
+                break; // Only process the first matched manifest
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error($"Post-update migration unhandled error: {ex.Message}");
+        }
+    }
+
     private async Task RunKmestuUpdateAsync()
     {
         if (_isKmestuUpdating)
@@ -4651,12 +4878,6 @@ public partial class MainWindow : Window
 
         // ── 1. Locate the bundled updater ────────────────────────────────────
         string? updaterPath = AppUpdateService.FindUpdaterExecutable();
-        if (updaterPath == null)
-        {
-            AppLogger.Warning("ZapretKmestu.Updater.exe не найден рядом с приложением.");
-            SetFooterMessage("Обновление недоступно: файл обновления не найден.", FooterMessageKind.Error, highlight: true);
-            return;
-        }
 
         // ── 2. Ensure we have a ZIP download URL ─────────────────────────────
         if (string.IsNullOrWhiteSpace(_latestKmestuZipUrl))
@@ -4703,6 +4924,48 @@ public partial class MainWindow : Window
                 return;
             }
 
+            string packageRoot = Path.GetFullPath(Path.GetDirectoryName(newExePath)!);
+            string manifestPath = Path.Combine(packageRoot, "release-manifest.json");
+            ReleaseManifest? manifest = null;
+            if (File.Exists(manifestPath))
+            {
+                try { manifest = System.Text.Json.JsonSerializer.Deserialize<ReleaseManifest>(File.ReadAllText(manifestPath)); } catch {}
+            }
+
+            if (manifest != null)
+            {
+                if (!ValidateReleaseManifest(packageRoot, manifest, isPreUpdate: true))
+                {
+                    AppLogger.Error("Manifest validation failed before update. Aborting.");
+                    SetFooterMessage("Ошибка валидации пакета обновления.", FooterMessageKind.Error, highlight: true);
+                    return;
+                }
+
+                var exeEntry = manifest.Files.First(f => string.Equals(f.Path.Replace("\\", "/"), "ZapretKmestu.exe", StringComparison.OrdinalIgnoreCase));
+                ValidateManifestPath(packageRoot, exeEntry.Path, out newExePath);
+                var updaterEntry = manifest.Files.First(f => string.Equals(f.Path.Replace("\\", "/"), "ZapretKmestu.Updater.exe", StringComparison.OrdinalIgnoreCase));
+                ValidateManifestPath(packageRoot, updaterEntry.Path, out string newUpdaterPath);
+                updaterPath = newUpdaterPath;
+
+                if (!File.Exists(updaterPath))
+                {
+                    AppLogger.Error("Staged updater not found even after manifest validation. Aborting.");
+                    SetFooterMessage("Файл обновления повреждён. Попробуйте снова.", FooterMessageKind.Error, highlight: true);
+                    return;
+                }
+                AppLogger.Info("Manifest validation passed. Using staged updater.");
+            }
+            else
+            {
+                AppLogger.Info("Legacy package without manifest. Falling back to local updater.");
+                if (string.IsNullOrEmpty(updaterPath))
+                {
+                    AppLogger.Warning("ZapretKmestu.Updater.exe не найден рядом с приложением (Legacy).");
+                    SetFooterMessage("Обновление недоступно: файл обновления не найден.", FooterMessageKind.Error, highlight: true);
+                    return;
+                }
+            }
+
             AppLogger.Info($"Файл обновления загружен: {newExePath} ({new FileInfo(newExePath).Length:N0} байт)");
 
             // ── 5. Determine paths ─────────────────────────────────────────
@@ -4713,6 +4976,8 @@ public partial class MainWindow : Window
             string backupPath = currentExePath + ".backup";
             int currentPid    = Environment.ProcessId;
 
+            AppLogger.Info($"Package Root  : {packageRoot}");
+            AppLogger.Info($"Manifest Ver  : {manifest?.SchemaVersion}");
             AppLogger.Info($"Текущий EXE   : {currentExePath}");
             AppLogger.Info($"Новый EXE     : {newExePath}");
             AppLogger.Info($"Резервная копия: {backupPath}");
@@ -4720,12 +4985,7 @@ public partial class MainWindow : Window
             AppLogger.Info($"Обновляющий   : {updaterPath}");
 
             // ── 6. Build updater argument string ──────────────────────────
-            string updaterArgs = $"--pid {currentPid}" +
-                                 $" --current \"{currentExePath}\"" +
-                                 $" --new \"{newExePath}\"" +
-                                 $" --backup \"{backupPath}\"";
-
-            AppLogger.Info($"Запуск обновляющего процесса: {updaterPath} {updaterArgs}");
+            AppLogger.Info($"Запуск обновляющего процесса: {updaterPath}");
             SetFooterMessage("Подготовка обновления… Приложение закроется.", FooterMessageKind.Info, highlight: true);
 
             // Brief UI pause so the user sees the message before the window closes.
@@ -4735,22 +4995,36 @@ public partial class MainWindow : Window
             var startInfo = new System.Diagnostics.ProcessStartInfo
             {
                 FileName        = updaterPath,
-                Arguments       = updaterArgs,
-                UseShellExecute = false,
-                CreateNoWindow  = true
+                UseShellExecute = true,
+                WorkingDirectory = Path.GetDirectoryName(updaterPath)
             };
+            startInfo.ArgumentList.Add("--pid");
+            startInfo.ArgumentList.Add(currentPid.ToString());
+            startInfo.ArgumentList.Add("--current");
+            startInfo.ArgumentList.Add(currentExePath);
+            startInfo.ArgumentList.Add("--new");
+            startInfo.ArgumentList.Add(newExePath);
+            startInfo.ArgumentList.Add("--backup");
+            startInfo.ArgumentList.Add(backupPath);
 
             _installCts?.Cancel();
 
-            System.Diagnostics.Process.Start(startInfo);
-            AppLogger.Info("Обновляющий процесс запущен. Закрываем приложение.");
-
-            // Shut down cleanly — updater will wait for this process to exit.
-            Dispatcher.Invoke(() =>
+            var proc = System.Diagnostics.Process.Start(startInfo);
+            if (proc != null)
             {
-                _isReallyClosing = true;
-                System.Windows.Application.Current.Shutdown(0);
-            });
+                AppLogger.Info($"Обновляющий процесс запущен (PID {proc.Id}). Закрываем приложение.");
+                // Shut down cleanly — updater will wait for this process to exit.
+                Dispatcher.Invoke(() =>
+                {
+                    _isReallyClosing = true;
+                    System.Windows.Application.Current.Shutdown(0);
+                });
+            }
+            else
+            {
+                AppLogger.Error("Process.Start failed to return a valid process instance.");
+                SetFooterMessage("Не удалось запустить процесс обновления.", FooterMessageKind.Error, highlight: true);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -7413,7 +7687,7 @@ public partial class MainWindow : Window
 
             var sb = new StringBuilder();
             sb.AppendLine("=== Zapret Kmestu — Отчёт ===");
-            sb.AppendLine($"Версия приложения : v0.1 beta");
+            sb.AppendLine($"Версия приложения : {GetDynamicAppDisplayVersion()}");
             sb.AppendLine($"Платформа         : .NET 8 · WPF");
             sb.AppendLine($"Время отчёта      : {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
             sb.AppendLine($"Ошибок            : {totalErrorCount}");
