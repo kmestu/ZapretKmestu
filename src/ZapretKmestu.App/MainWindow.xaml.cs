@@ -52,6 +52,9 @@ public partial class MainWindow : Window
     private AppSettings Settings => App.Settings;
 
     private readonly ZapretInstallerService _installer;
+    private readonly ZapretExtractionService _extractionService;
+    private const string BundledArchiveFileName = "zapret-flowseal-1.9.9d-bundled.zip";
+    private const string BundledArchiveExpectedVersion = "1.9.9d";
     private readonly ZapretProfileService _profileService;
     private readonly AdminService _adminService;
     private readonly ZapretServiceStatusService _statusService;
@@ -184,8 +187,8 @@ public partial class MainWindow : Window
         var http = GitHubReleaseService.CreateHttpClient();
         _releaseService = new GitHubReleaseService(http);
         var downloadService = new ZapretDownloadService(http);
-        var extractionService = new ZapretExtractionService();
-        _installer = new ZapretInstallerService(_releaseService, downloadService, extractionService, Settings);
+        _extractionService = new ZapretExtractionService();
+        _installer = new ZapretInstallerService(_releaseService, downloadService, _extractionService, Settings);
         _profileService = new ZapretProfileService(AppPaths.ZapretDirectory);
         _adminService = new AdminService();
         _statusService = new ZapretServiceStatusService();
@@ -4243,33 +4246,76 @@ public partial class MainWindow : Window
             bool localFilesValid = await Task.Run(() => _installer.ValidateLocalInstall());
             AppLogger.Info($"Валидность локальных файлов: {localFilesValid}");
 
-            progressReporter.Report(new InstallProgressInfo { Step = "Проверяем актуальную версию..." });
+            ZapretInstallResult? bundledResult = null;
+            bool requiresRemoteCheck = true;
+
+            if (!localFilesValid)
+            {
+                string bundledArchivePath = Path.Combine(AppContext.BaseDirectory, "Engine", BundledArchiveFileName);
+                bool bundledFileExists = File.Exists(bundledArchivePath);
+                bool targetDirEmptyOrAbsent = !Directory.Exists(AppPaths.ZapretDirectory) || !Directory.EnumerateFileSystemEntries(AppPaths.ZapretDirectory).Any();
+
+                if (!isUpdate && !Settings.IsZapretInstalled && !status.Exists && bundledFileExists && targetDirEmptyOrAbsent)
+                {
+                    progressReporter.Report(new InstallProgressInfo { Step = "Устанавливаем zapret из файлов приложения..." });
+                    try
+                    {
+                        var extractResult = await _extractionService.ExtractAndInstallAsync(bundledArchivePath, progressReporter, _installCts!.Token);
+                        if (!extractResult.IsValid)
+                        {
+                            bundledResult = ZapretInstallResult.Failed("Не удалось извлечь встроенные файлы zapret.");
+                        }
+                        else
+                        {
+                            Settings.IsZapretInstalled = true;
+                            Settings.InstalledZapretVersion = BundledArchiveExpectedVersion;
+                            Settings.ZapretPath = AppPaths.ZapretDirectory;
+                            SettingsService.Save(Settings, AppPaths.SettingsFilePath);
+                            bundledResult = ZapretInstallResult.Successful(BundledArchiveExpectedVersion, AppPaths.ZapretDirectory);
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        bundledResult = ZapretInstallResult.Failed("Операция отменена.");
+                    }
+                    requiresRemoteCheck = false;
+                }
+            }
 
             GitHubReleaseInfo? remoteRelease = null;
             bool githubUnavailable = false;
-            try
+
+            if (requiresRemoteCheck)
             {
-                remoteRelease = await _releaseService.GetLatestReleaseAsync(_installCts.Token);
-            }
-            catch (OperationCanceledException) when (_installCts.Token.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex) when (ex is HttpRequestException || ex is InvalidOperationException)
-            {
-                githubUnavailable = true;
-                AppLogger.Error($"Ошибка при проверке GitHub: {ex.Message}");
-            }
-            catch (Exception ex)
-            {
-                AppLogger.Error($"Неожиданная ошибка при проверке GitHub: {ex.Message}");
-                throw;
+                progressReporter.Report(new InstallProgressInfo { Step = "Проверяем актуальную версию..." });
+                try
+                {
+                    remoteRelease = await _releaseService.GetLatestReleaseAsync(_installCts.Token);
+                }
+                catch (OperationCanceledException) when (_installCts.Token.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (ex is HttpRequestException || ex is InvalidOperationException)
+                {
+                    githubUnavailable = true;
+                    AppLogger.Error($"Ошибка при проверке GitHub: {ex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Error($"Неожиданная ошибка при проверке GitHub: {ex.Message}");
+                    throw;
+                }
             }
 
             ZapretInstallResult result;
 
+            if (bundledResult != null)
+            {
+                result = bundledResult;
+            }
             // Branch A
-            if (!localFilesValid)
+            else if (!localFilesValid)
             {
                 if (githubUnavailable)
                 {
