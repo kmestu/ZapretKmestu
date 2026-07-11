@@ -13,14 +13,19 @@
     <StartupObject>ZapretKmestu.App</StartupObject>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     
-    <Version>0.1.0-beta</Version>
-    <AssemblyVersion>0.1.0.0</AssemblyVersion>
-    <FileVersion>0.1.0.0</FileVersion>
-    <InformationalVersion>0.1.0-beta</InformationalVersion>
+    <Version>0.2.0-beta</Version>
+    <AssemblyVersion>0.2.0.0</AssemblyVersion>
+    <FileVersion>0.2.0.0</FileVersion>
+    <InformationalVersion>0.2-beta</InformationalVersion>
     <Product>Zapret Kmestu</Product>
     <Description>GUI оболочка для управления zapret</Description>
     <Company>Kmestu</Company>
     <Authors>Kmestu</Authors>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
   <ItemGroup>
@@ -30,5 +35,36 @@
     <Resource Include="Assets\Icons\tray_autopick.ico" />
     <Resource Include="Assets\Icons\tray_vpn.ico" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!-- Ensures the updater is built before publishing, without creating a runtime DLL dependency -->
+    <ProjectReference Include="..\ZapretKmestu.Updater\ZapretKmestu.Updater.csproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
+    </ProjectReference>
+  </ItemGroup>
+
+  <!-- Injects the updater executable into the final publish output directory -->
+  <Target Name="IncludeUpdaterInPublish" AfterTargets="ComputeFilesToPublish">
+    <!-- Publish the updater project as a single-file self-contained executable -->
+    <Exec Command="dotnet publish &quot;..\ZapretKmestu.Updater\ZapretKmestu.Updater.csproj&quot; -c $(Configuration) -r $(RuntimeIdentifier) --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o &quot;..\ZapretKmestu.Updater\bin\$(Configuration)\publish-temp&quot;" />
+    
+    <!-- Exclude any auto-included updater artifacts (like runtimeconfig.json or pdb from ProjectReference) -->
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="$([System.String]::Copy('%(Filename)').StartsWith('ZapretKmestu.Updater'))" />
+    </ItemGroup>
+
+    <!-- Include ONLY the compiled single-file executable in the publish output -->
+    <ItemGroup>
+      <ResolvedFileToPublish Include="..\ZapretKmestu.Updater\bin\$(Configuration)\publish-temp\ZapretKmestu.Updater.exe">
+        <RelativePath>ZapretKmestu.Updater.exe</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+      <ResolvedFileToPublish Include="..\..\README_RELEASE.txt">
+        <RelativePath>README_RELEASE.txt</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
 
 </Project>

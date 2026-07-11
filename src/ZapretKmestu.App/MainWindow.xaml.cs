@@ -63,8 +63,11 @@ public partial class MainWindow : Window
     private DateTime _lastManualUpdateCheckUtc = DateTime.MinValue;
     private GitHubReleaseInfo? _latestRelease;   // zapret (Flowseal)
     private string? _latestKmestuRelease;          // ZapretKmestu tag from GitHub
+    private string? _latestKmestuZipUrl;           // direct download URL for ZapretKmestu ZIP asset
     private bool _isUpdateAvailable;               // zapret update available
     private bool _isKmestuUpdateAvailable;         // Zapret Kmestu update available
+    private bool _isKmestuUpdating;                // true while downloading / preparing Kmestu update
+    private readonly AppUpdateService _appUpdateService = new(AppUpdateService.CreateHttpClient());
 #if DEBUG
     public enum UpdateCenterDebugState
     {
@@ -97,6 +100,7 @@ public partial class MainWindow : Window
     private bool _suppressWizardFooterNoise = false;
     private DateTime? _autopickStartTime = null;
     private CancellationTokenSource? _wizardCts;
+    private TaskCompletionSource? _wizardCompletionTcs;
     private DateTime? _lastCheckTime;
     private string? _bestProfileCandidate;
     private int _bestProfileScore = -1;
@@ -269,14 +273,21 @@ public partial class MainWindow : Window
 
     private async void HandleStartupUpdates()
     {
-        bool checkZapret  = Settings.AutoCheckUpdatesOnStartup;
-        bool checkKmestu  = Settings.AutoCheckKmestuOnStartup;
-
-        if (checkZapret || checkKmestu)
+        try
         {
-            // Delay to let UI initialize and show initial status
-            await Task.Delay(2000);
-            await CheckZapretUpdatesAsync(isAutomatic: true, checkZapret: checkZapret, checkKmestu: checkKmestu);
+            bool checkZapret  = Settings.AutoCheckUpdatesOnStartup;
+            bool checkKmestu  = Settings.AutoCheckKmestuOnStartup;
+
+            if (checkZapret || checkKmestu)
+            {
+                // Delay to let UI initialize and show initial status
+                await Task.Delay(2000);
+                await CheckZapretUpdatesAsync(isAutomatic: true, checkZapret: checkZapret, checkKmestu: checkKmestu);
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error($"Ошибка при проверке обновлений при запуске: {ex.Message}");
         }
     }
 
@@ -409,8 +420,24 @@ public partial class MainWindow : Window
         if (_isReallyClosing) return;
         _isReallyClosing = true;
 
+        if (_isWizardRunning)
+        {
+            AppLogger.Info("Запрошен выход во время автоподбора. Ожидание отмены и восстановления...");
+            SetFooterMessage("Завершение работы...", FooterMessageKind.Info, highlight: true);
+        }
+
         _wizardCts?.Cancel();
         _installCts?.Cancel();
+
+        var tcs = _wizardCompletionTcs;
+        if (tcs != null)
+        {
+            try { await tcs.Task; }
+            catch (Exception ex)
+            {
+                AppLogger.Error($"Ошибка ожидания завершения автоподбора при выходе: {ex.Message}");
+            }
+        }
 
         // Optional bypass stop on exit
         if (Settings.StopBypassOnAppExit && Settings.IsZapretInstalled)
@@ -465,6 +492,7 @@ public partial class MainWindow : Window
 
     private async Task CheckStatusOnStartup()
     {
+        ReconcileZapretState();
         // 1. Check admin status
         bool isAdmin = _adminService.IsRunningAsAdministrator();
         if (isAdmin)
@@ -543,8 +571,10 @@ public partial class MainWindow : Window
         string? busyTooltip = isBusy ? "Выполняется другая операция" : adminTooltip;
 
         // Hero button
-        ToggleButton.IsEnabled = isAdmin || !Settings.IsZapretInstalled || isBusy;
-        ToggleButton.ToolTip = isBusy ? null : adminTooltip;
+        bool toggleEnabled = isAdmin || !Settings.IsZapretInstalled || isBusy;
+        if (_isWizardRunning) toggleEnabled = _wizardCts == null || !_wizardCts.IsCancellationRequested;
+        ToggleButton.IsEnabled = toggleEnabled;
+        ToggleButton.ToolTip = isBusy && !_isWizardRunning ? "Выполняется другая операция" : adminTooltip;
 
         // Action buttons
         BestProfileButton.IsEnabled = isAdmin && !isBusy;
@@ -553,16 +583,19 @@ public partial class MainWindow : Window
         FixAllButton.ToolTip = busyTooltip;
         CheckConnectionButton.IsEnabled = !isBusy;
 
+        // Profile combo boxes
+        if (ProfileComboBox != null) ProfileComboBox.IsEnabled = Settings.IsZapretInstalled && !isBusy;
+        if (HomeProfileComboBox != null) HomeProfileComboBox.IsEnabled = Settings.IsZapretInstalled && !isBusy;
+
         // Expert page buttons
         ReinstallServiceButton.IsEnabled = isAdmin && !isBusy;
         ReinstallServiceButton.ToolTip = busyTooltip;
         UninstallAppButton.IsEnabled = isAdmin && !isBusy;
         UninstallAppButton.ToolTip = busyTooltip;
 
-
         if (_isWizardRunning)
         {
-            ToggleButtonText.Text = "ОТМЕНИТЬ";
+            ToggleButtonText.Text = (_wizardCts != null && _wizardCts.IsCancellationRequested) ? "ОТМЕНА..." : "ОТМЕНИТЬ";
         }
         else if (_installCts != null)
         {
@@ -609,12 +642,37 @@ public partial class MainWindow : Window
         }
         else if (!Settings.IsZapretInstalled)
         {
-            newTitle = "Не установлен";
-            titleBrushKey = "IndigoBrush";
-            newHelperText = "Сначала установите zapret";
-            newIconKind = HeroIconKind.NotInstalled;
-            circleBrushKey = "IndigoBrush";
-            glowColorKey = "IndigoColor";
+            bool localValid = false;
+            try { localValid = _installer.ValidateLocalInstall(); } catch { }
+
+            if (status.Exists && !localValid)
+            {
+                newTitle = "Ошибка установки";
+                titleBrushKey = "DangerBrush";
+                newHelperText = "Требуется восстановление файлов";
+                newIconKind = HeroIconKind.Warning;
+                circleBrushKey = "DangerBrush";
+                glowColorKey = "DangerColor";
+            }
+            else if (!status.Exists && localValid)
+            {
+                newTitle = "Не установлен";
+                titleBrushKey = "IndigoBrush";
+                newHelperText = "Локальные файлы найдены · требуется установка";
+                newIconKind = HeroIconKind.NotInstalled;
+                circleBrushKey = "IndigoBrush";
+                glowColorKey = "IndigoColor";
+            }
+            else
+            {
+                newTitle = "Не установлен";
+                titleBrushKey = "IndigoBrush";
+                newHelperText = "Сначала установите zapret";
+                newIconKind = HeroIconKind.NotInstalled;
+                circleBrushKey = "IndigoBrush";
+                glowColorKey = "IndigoColor";
+            }
+
             badgeBgKey = "HeroVersionBadgeActiveBackgroundBrush";
             badgeBorderKey = "HeroVersionBadgeActiveBorderBrush";
             badgeTextKey = "HeroVersionBadgeActiveTextBrush";
@@ -1139,6 +1197,12 @@ public partial class MainWindow : Window
 
     private async void UpdateCheckButton_Click(object sender, RoutedEventArgs e)
     {
+        if (_isWizardRunning)
+        {
+            AppLogger.Info("Проверка обновлений пропущена: выполняется автоподбор профиля.");
+            return;
+        }
+
         if (_isCheckingUpdates) return;
 
         var now = DateTime.UtcNow;
@@ -1154,6 +1218,16 @@ public partial class MainWindow : Window
 
     private async Task CheckZapretUpdatesAsync(bool isAutomatic, bool checkZapret = true, bool checkKmestu = true)
     {
+        if (_isWizardRunning)
+        {
+            if (!isAutomatic)
+            {
+                AppLogger.Info("Проверка обновлений пропущена: выполняется автоподбор профиля.");
+            }
+
+            return;
+        }
+
         if (_isCheckingUpdates)
         {
             if (!isAutomatic)
@@ -1222,10 +1296,33 @@ public partial class MainWindow : Window
                         "https://api.github.com/repos/kmestu/ZapretKmestu/releases/latest").ConfigureAwait(false);
 
                     using var doc = System.Text.Json.JsonDocument.Parse(kmestuJson);
-                    _latestKmestuRelease = doc.RootElement
+                    var root = doc.RootElement;
+
+                    _latestKmestuRelease = root
                         .TryGetProperty("tag_name", out var tagEl) && tagEl.ValueKind == System.Text.Json.JsonValueKind.String
                         ? tagEl.GetString() ?? ""
                         : "";
+
+                    // Find the ZapretKmestu ZIP asset download URL (.zip ending)
+                    _latestKmestuZipUrl = null;
+                    if (root.TryGetProperty("assets", out var assetsEl) &&
+                        assetsEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+                    {
+                        foreach (var asset in assetsEl.EnumerateArray())
+                        {
+                            if (asset.TryGetProperty("name", out var nameEl) &&
+                                nameEl.ValueKind == System.Text.Json.JsonValueKind.String &&
+                                nameEl.GetString()?.EndsWith(".zip", StringComparison.OrdinalIgnoreCase) == true)
+                            {
+                                if (asset.TryGetProperty("browser_download_url", out var urlEl) &&
+                                    urlEl.ValueKind == System.Text.Json.JsonValueKind.String)
+                                {
+                                    _latestKmestuZipUrl = urlEl.GetString();
+                                }
+                                break;
+                            }
+                        }
+                    }
 
                     // Compare with current assembly informational version
                     string currentKmestuVersion = System.Reflection.CustomAttributeExtensions
@@ -1234,10 +1331,12 @@ public partial class MainWindow : Window
                         ?.InformationalVersion ?? "";
 
                     _isKmestuUpdateAvailable = !string.IsNullOrWhiteSpace(_latestKmestuRelease)
-                        && !IsSameVersion(currentKmestuVersion, _latestKmestuRelease);
+                        && IsNewerVersion(currentKmestuVersion, _latestKmestuRelease)
+                        && !string.IsNullOrWhiteSpace(_latestKmestuZipUrl);
 
                     AppLogger.Info($"Текущая версия Kmestu: {currentKmestuVersion}");
                     AppLogger.Info($"Последняя версия Kmestu: {_latestKmestuRelease}");
+                    AppLogger.Info($"URL ZIP-обновления Kmestu: {_latestKmestuZipUrl ?? "(не найден)"}");
                     AppLogger.Info($"Обновление Kmestu доступно: {_isKmestuUpdateAvailable}");
                 }
                 catch (Exception exKmestu)
@@ -1245,6 +1344,7 @@ public partial class MainWindow : Window
                     // Non-fatal: if Kmestu release check fails, just skip it silently
                     AppLogger.Info($"Не удалось проверить обновление Kmestu: {exKmestu.Message}");
                     _latestKmestuRelease = null;
+                    _latestKmestuZipUrl = null;
                     _isKmestuUpdateAvailable = false;
                 }
             }
@@ -1279,6 +1379,7 @@ public partial class MainWindow : Window
             _hasUpdateCheckError = true;
             _isUpdateAvailable = false;
             _isKmestuUpdateAvailable = false;
+            _latestKmestuZipUrl = null;
             _latestRelease = null;
             _latestKmestuRelease = null;
 
@@ -1317,15 +1418,122 @@ public partial class MainWindow : Window
         return match;
     }
 
+    private bool IsNewerVersion(string installed, string latest)
+    {
+        var v1 = NormalizeVersion(installed);
+        var v2 = NormalizeVersion(latest);
+
+        if (string.Equals(v1, v2, StringComparison.OrdinalIgnoreCase))
+        {
+            AppLogger.Info($"Сравнение версий: '{v1}' == '{v2}' -> совпадают (обновление не требуется)");
+            return false;
+        }
+
+        string[] parts1 = v1.Split(new[] { '-' }, 2);
+        string[] parts2 = v2.Split(new[] { '-' }, 2);
+
+        Version parsed1 = Version.TryParse(parts1[0], out var p1) ? p1 : new Version(0, 0);
+        Version parsed2 = Version.TryParse(parts2[0], out var p2) ? p2 : new Version(0, 0);
+
+        if (parsed2 > parsed1)
+        {
+            AppLogger.Info($"Сравнение версий: '{v2}' > '{v1}' -> доступно обновление");
+            return true;
+        }
+        else if (parsed2 < parsed1)
+        {
+            AppLogger.Info($"Сравнение версий: '{v2}' < '{v1}' -> установлена более новая версия");
+            return false;
+        }
+
+        // Numeric versions are equal, check pre-release tags
+        bool hasTag1 = parts1.Length > 1;
+        bool hasTag2 = parts2.Length > 1;
+
+        if (!hasTag1 && hasTag2) return false; // 0.2 > 0.2-beta
+        if (hasTag1 && !hasTag2) return true;  // 0.2-beta < 0.2
+
+        if (hasTag1 && hasTag2)
+        {
+            int cmp = string.Compare(parts1[1], parts2[1], StringComparison.OrdinalIgnoreCase);
+            if (cmp < 0)
+            {
+                AppLogger.Info($"Сравнение версий: '{v2}' > '{v1}' (по тегу) -> доступно обновление");
+                return true;
+            }
+        }
+
+        AppLogger.Info($"Сравнение версий: '{v2}' <= '{v1}' -> обновление не требуется");
+        return false;
+    }
+
     private string NormalizeVersion(string v)
     {
         if (string.IsNullOrWhiteSpace(v)) return "";
 
         v = v.Trim();
-        if (v.StartsWith("v", StringComparison.OrdinalIgnoreCase))
-            v = v.Substring(1);
 
-        return v;
+        // 1. Remove build metadata (e.g., "+6042b9bb...")
+        int plusIndex = v.IndexOf('+');
+        if (plusIndex >= 0)
+        {
+            v = v.Substring(0, plusIndex);
+        }
+
+        // 2. Remove leading 'v'
+        if (v.StartsWith("v", StringComparison.OrdinalIgnoreCase))
+        {
+            v = v.Substring(1);
+        }
+
+        // Try zapret-specific normalization (e.g. 1.9.9d -> 1.9.9.4)
+        var zapretMatch = System.Text.RegularExpressions.Regex.Match(v, @"^([0-9]+)\.([0-9]+)\.([0-9]+)([a-zA-Z])?$");
+        if (zapretMatch.Success)
+        {
+            string major = zapretMatch.Groups[1].Value;
+            string minor = zapretMatch.Groups[2].Value;
+            string build = zapretMatch.Groups[3].Value;
+            string letterGroup = zapretMatch.Groups[4].Value;
+
+            int revision = 0;
+            if (!string.IsNullOrEmpty(letterGroup))
+            {
+                char c = char.ToLower(letterGroup[0]);
+                if (c >= 'a' && c <= 'z')
+                {
+                    revision = c - 'a' + 1; // a=1, b=2, c=3, d=4, etc.
+                }
+            }
+            return $"{major}.{minor}.{build}.{revision}";
+        }
+
+        // 3. Normalize semver components (e.g., "0.2.0-beta" -> "0.2-beta")
+        string[] parts = v.Split(new[] { '-' }, 2);
+        string versionPart = parts[0];
+
+        if (Version.TryParse(versionPart, out Version parsedVersion))
+        {
+            int major = parsedVersion.Major >= 0 ? parsedVersion.Major : 0;
+            int minor = parsedVersion.Minor >= 0 ? parsedVersion.Minor : 0;
+            int build = parsedVersion.Build >= 0 ? parsedVersion.Build : 0;
+
+            // Omit build component if it is 0 (so "0.2.0" == "0.2")
+            if (build == 0)
+            {
+                versionPart = $"{major}.{minor}";
+            }
+            else
+            {
+                versionPart = $"{major}.{minor}.{build}";
+            }
+        }
+
+        if (parts.Length > 1)
+        {
+            return $"{versionPart}-{parts[1]}";
+        }
+
+        return versionPart;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1352,9 +1560,22 @@ public partial class MainWindow : Window
         UpdateStatusBorder.Padding = new Thickness(10, 0, 10, 0);
 
         // UpdateCheckButton enabled state
-        bool isCheckEnabled = !_isCheckingUpdates && _installCts == null;
+        bool updateInteractionAllowed = !_isWizardRunning;
+
+        bool isCheckEnabled =
+            updateInteractionAllowed &&
+            !_isCheckingUpdates &&
+            _installCts == null &&
+            !_isKmestuUpdating;
+
         UpdateCheckButton.IsEnabled = isCheckEnabled;
-        UpdateCheckButton.ToolTip = "Проверить обновления";
+        UpdateCheckButton.IsHitTestVisible = updateInteractionAllowed;
+        UpdateCheckButton.Focusable = updateInteractionAllowed;
+        UpdateCheckButton.IsTabStop = updateInteractionAllowed;
+        UpdateCheckButton.Cursor = isCheckEnabled
+            ? System.Windows.Input.Cursors.Hand
+            : System.Windows.Input.Cursors.Arrow;
+        UpdateCheckButton.ToolTip = _isWizardRunning ? "Недоступно во время автоподбора" : "Проверить обновления";
 
         // Determine if updates are available
         bool hasZapretUpdate = (!Settings.IsZapretInstalled && _latestRelease != null) || _isUpdateAvailable || _hasInstallError;
@@ -1370,13 +1591,17 @@ public partial class MainWindow : Window
 
         // HeaderInstallUpdateButton enabled state
         bool isInstallUpdateEnabled = (hasZapretUpdate || hasKmestuUpdate) &&
+                                     !_isWizardRunning &&
                                      !_isCheckingUpdates &&
-                                     _installCts == null;
+                                     _installCts == null &&
+                                     !_isKmestuUpdating;
         HeaderInstallUpdateButton.IsEnabled = isInstallUpdateEnabled;
 
         // Tooltip state for install/update button
         string installUpdateToolTip;
-        if (_installCts != null)
+        if (_isKmestuUpdating)
+            installUpdateToolTip = "Загрузка обновления Kmestu...";
+        else if (_installCts != null)
             installUpdateToolTip = "Установка выполняется";
         else if (_isCheckingUpdates)
             installUpdateToolTip = "Проверка выполняется";
@@ -1415,6 +1640,13 @@ public partial class MainWindow : Window
         {
             // Checking in progress
             SetBadge("Проверяем...", "UpdateBadgeNeutralBackgroundBrush", "UpdateBadgeNeutralTextBrush", arrowVisible: false, clickable: false);
+            UpdateItemsControl.ItemsSource = items;
+            return;
+        }
+
+        if (_isKmestuUpdating)
+        {
+            SetBadge("Загрузка Kmestu...", "UpdateBadgeBusyBackgroundBrush", "UpdateBadgeBusyTextBrush", arrowVisible: false, clickable: false);
             UpdateItemsControl.ItemsSource = items;
             return;
         }
@@ -1529,6 +1761,12 @@ public partial class MainWindow : Window
 
     private void UpdateStatusBorder_PreviewMouseLeftButtonDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
+        if (_isWizardRunning)
+        {
+            e.Handled = true;
+            return;
+        }
+
         // Only open popup if there are real update items to show
         var items = UpdateItemsControl.ItemsSource as System.Collections.Generic.List<AppUpdateItem>;
         if (items == null || items.Count == 0) return;
@@ -1573,11 +1811,7 @@ public partial class MainWindow : Window
         {
             if (item.Name == "Kmestu")
             {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "https://github.com/kmestu/ZapretKmestu/releases/latest",
-                    UseShellExecute = true
-                });
+                await RunKmestuUpdateAsync();
             }
             else if (item.Name == "zapret")
             {
@@ -1674,6 +1908,12 @@ public partial class MainWindow : Window
         PageScenarios.Visibility = page == "scenarios"   ? Visibility.Visible : Visibility.Collapsed;
         PageDiag.Visibility      = page == "diagnostics" ? Visibility.Visible : Visibility.Collapsed;
         PageSettings.Visibility  = page == "settings"    ? Visibility.Visible : Visibility.Collapsed;
+
+        if (page == "scenarios")
+        {
+            UpdateScenarioStatusUi();
+            SyncGameFilterUiFromActualState();
+        }
 
         NavHomeButton.Style      = GetNavStyle(page == "home");
         NavExpertButton.Style    = GetNavStyle(page == "expert");
@@ -1772,6 +2012,13 @@ public partial class MainWindow : Window
 
     private async void GameFilterToggle_Changed(object sender, RoutedEventArgs e)
     {
+        if (_isWizardRunning)
+        {
+            e.Handled = true;
+            AppLogger.Info("Blocked GameFilterToggle_Changed while auto-pick is active.");
+            SyncGameFilterUiFromActualState();
+            return;
+        }
         if (!_isInitialized || _suppressGameFilterToggleEvents) return;
         
         if (_isGameFilterOperationRunning)
@@ -1805,6 +2052,11 @@ public partial class MainWindow : Window
 
     private void GameFilterButton_Click(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
+        if (_isWizardRunning)
+        {
+            AppLogger.Info("Blocked GameFilterButton_Click while auto-pick is active.");
+            return;
+        }
         bool isRunning = _statusService.GetStatus().IsRunning;
         bool isGameFilterActive = isRunning && Settings.AppliedWorkMode == WorkModeGameKey;
         if (isGameFilterActive)
@@ -1856,6 +2108,11 @@ public partial class MainWindow : Window
 
     private void GameScopeButton_Click(object sender, System.Windows.Input.MouseButtonEventArgs e)
     {
+        if (_isWizardRunning)
+        {
+            AppLogger.Info("Blocked GameScopeButton_Click while auto-pick is active.");
+            return;
+        }
         bool isRunning = _statusService.GetStatus().IsRunning;
         bool isGameFilterActive = isRunning && Settings.AppliedWorkMode == WorkModeGameKey;
         if (isGameFilterActive)
@@ -1918,19 +2175,8 @@ public partial class MainWindow : Window
 
     private void UpdateScenarioStatusUi()
     {
-        // UI text/badge is now strictly controlled by ApplyStatusToUi based on actual service state.
-        // We only show error states if zapret is entirely missing.
         if (ApplyGameFilterStatusText == null || ScenarioStatusBadge == null) return;
-        
-        if (!Settings.IsZapretInstalled || string.IsNullOrEmpty(AppPaths.ZapretDirectory) || !System.IO.Directory.Exists(AppPaths.ZapretDirectory))
-        {
-            ApplyGameFilterStatusText.Text = "zapret не установлен";
-            ScenarioStatusBadge.BorderThickness = new System.Windows.Thickness(0);
-            ScenarioStatusBadge.BorderBrush = null;
-            ScenarioStatusBadge.SetResourceReference(System.Windows.Controls.Border.BackgroundProperty, "DangerTintBrush");
-            ApplyGameFilterStatusText.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "DangerBrush");
-            return;
-        }
+        SyncGameFilterUiFromActualState();
     }
 
     private void ShowSuccessStatus()
@@ -1944,6 +2190,40 @@ public partial class MainWindow : Window
         if (GameFilterToggle == null || ScenarioStatusBadge == null || ApplyGameFilterStatusText == null)
             return;
 
+        if (_isWizardRunning)
+        {
+            ApplyGameFilterStatusText.Text = "Недоступно в момент подбора";
+            ApplyGameFilterStatusText.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "BusyBadgeTextBrush");
+            ScenarioStatusBadge.SetResourceReference(System.Windows.Controls.Border.BackgroundProperty, "BusyBadgeBackgroundBrush");
+            ScenarioStatusBadge.SetResourceReference(System.Windows.Controls.Border.BorderBrushProperty, "BusyBadgeBorderBrush");
+            ScenarioStatusBadge.BorderThickness = new System.Windows.Thickness(1);
+
+            _suppressGameFilterToggleEvents = true;
+            try
+            {
+                GameFilterToggle.IsEnabled = false;
+                GameFilterToggle.IsHitTestVisible = false;
+                GameFilterToggle.Focusable = false;
+                GameFilterToggle.IsTabStop = false;
+
+                if (ScenarioGameOptionsPanel != null)
+                {
+                    ScenarioGameOptionsPanel.IsEnabled = false;
+                    ScenarioGameOptionsPanel.Opacity = 0.5;
+                }
+
+                if (GameFilterLockedHint != null)
+                {
+                    GameFilterLockedHint.Visibility = System.Windows.Visibility.Visible;
+                }
+            }
+            finally
+            {
+                _suppressGameFilterToggleEvents = false;
+            }
+            return;
+        }
+
         if (isBusy && !string.IsNullOrEmpty(busyStatus))
         {
             ApplyGameFilterStatusText.Text = busyStatus;
@@ -1953,44 +2233,154 @@ public partial class MainWindow : Window
             ScenarioStatusBadge.BorderThickness = new System.Windows.Thickness(1);
 
             _suppressGameFilterToggleEvents = true;
-            GameFilterToggle.IsEnabled = false;
-            if (ScenarioGameOptionsPanel != null)
+            try
             {
-                ScenarioGameOptionsPanel.IsEnabled = false;
-                ScenarioGameOptionsPanel.Opacity = 0.5;
-            }
+                GameFilterToggle.IsEnabled = false;
+                GameFilterToggle.IsHitTestVisible = false;
+                GameFilterToggle.Focusable = false;
+                GameFilterToggle.IsTabStop = false;
 
-            if (GameFilterLockedHint != null)
-            {
-                GameFilterLockedHint.Visibility = System.Windows.Visibility.Visible;
+                if (ScenarioGameOptionsPanel != null)
+                {
+                    ScenarioGameOptionsPanel.IsEnabled = false;
+                    ScenarioGameOptionsPanel.Opacity = 0.5;
+                }
+
+                if (GameFilterLockedHint != null)
+                {
+                    GameFilterLockedHint.Visibility = System.Windows.Visibility.Visible;
+                }
             }
-            _suppressGameFilterToggleEvents = false;
+            finally
+            {
+                _suppressGameFilterToggleEvents = false;
+            }
             return;
         }
 
         // Active state depends strictly on actual running service AND applied mode
-        bool isRunning = status?.IsRunning ?? _statusService.GetStatus().IsRunning;
+        var currentStatus = status ?? _statusService.GetStatus();
+        bool isRunning = currentStatus.IsRunning;
+        bool serviceExists = currentStatus.Exists;
+        bool localValid = false;
+        try { localValid = _installer.ValidateLocalInstall(); } catch { }
+
+        // State 4: Files absent/invalid, service absent
+        if (!serviceExists && !localValid)
+        {
+            ApplyGameFilterStatusText.Text = "zapret не установлен";
+            ScenarioStatusBadge.BorderThickness = new System.Windows.Thickness(0);
+            ScenarioStatusBadge.BorderBrush = null;
+            ScenarioStatusBadge.SetResourceReference(System.Windows.Controls.Border.BackgroundProperty, "DangerTintBrush");
+            ApplyGameFilterStatusText.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "DangerBrush");
+
+            _suppressGameFilterToggleEvents = true;
+            try
+            {
+                GameFilterToggle.IsEnabled = false;
+                GameFilterToggle.IsChecked = false;
+                if (ScenarioGameOptionsPanel != null) { ScenarioGameOptionsPanel.IsEnabled = false; ScenarioGameOptionsPanel.Opacity = 0.5; }
+                if (GameFilterLockedHint != null) { GameFilterLockedHint.Visibility = System.Windows.Visibility.Collapsed; }
+            }
+            finally
+            {
+                _suppressGameFilterToggleEvents = false;
+            }
+            return;
+        }
+
+        // State 3: Files valid, service absent
+        if (!serviceExists && localValid)
+        {
+            ApplyGameFilterStatusText.Text = "Требуется установка службы";
+            ScenarioStatusBadge.BorderThickness = new System.Windows.Thickness(0);
+            ScenarioStatusBadge.BorderBrush = null;
+            ScenarioStatusBadge.SetResourceReference(System.Windows.Controls.Border.BackgroundProperty, "DangerTintBrush");
+            ApplyGameFilterStatusText.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "DangerBrush");
+
+            _suppressGameFilterToggleEvents = true;
+            try
+            {
+                GameFilterToggle.IsEnabled = false;
+                GameFilterToggle.IsChecked = false;
+                if (ScenarioGameOptionsPanel != null) { ScenarioGameOptionsPanel.IsEnabled = false; ScenarioGameOptionsPanel.Opacity = 0.5; }
+                if (GameFilterLockedHint != null) { GameFilterLockedHint.Visibility = System.Windows.Visibility.Collapsed; }
+            }
+            finally
+            {
+                _suppressGameFilterToggleEvents = false;
+            }
+            return;
+        }
+
+        // State 5: Service exists but files invalid
+        if (serviceExists && !localValid)
+        {
+            ApplyGameFilterStatusText.Text = "Требуется восстановление";
+            ScenarioStatusBadge.BorderThickness = new System.Windows.Thickness(0);
+            ScenarioStatusBadge.BorderBrush = null;
+            ScenarioStatusBadge.SetResourceReference(System.Windows.Controls.Border.BackgroundProperty, "DangerTintBrush");
+            ApplyGameFilterStatusText.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "DangerBrush");
+
+            _suppressGameFilterToggleEvents = true;
+            try
+            {
+                GameFilterToggle.IsEnabled = false;
+                GameFilterToggle.IsChecked = false;
+                if (ScenarioGameOptionsPanel != null) { ScenarioGameOptionsPanel.IsEnabled = false; ScenarioGameOptionsPanel.Opacity = 0.5; }
+                if (GameFilterLockedHint != null) { GameFilterLockedHint.Visibility = System.Windows.Visibility.Collapsed; }
+            }
+            finally
+            {
+                _suppressGameFilterToggleEvents = false;
+            }
+            return;
+        }
+
+        // States 1 & 2: Valid files and service exists
         bool isGameFilterActive = isRunning && Settings.AppliedWorkMode == WorkModeGameKey;
 
+        bool isAdmin = _adminService.IsRunningAsAdministrator();
+        bool hasConflictingOperation =
+            isBusy ||
+            _isGameFilterOperationRunning ||
+            _isWizardRunning ||
+            _installCts != null ||
+            _isTrayBypassToggleRunning ||
+            _isTrayProfileApplyRunning ||
+            (OperationProgressCard != null && OperationProgressCard.Visibility == Visibility.Visible);
+
+        bool canChangeGameFilter = Settings.IsZapretInstalled && isAdmin && !hasConflictingOperation;
+        bool canEditOptions = canChangeGameFilter && !isGameFilterActive;
+
         _suppressGameFilterToggleEvents = true;
-        
-        GameFilterToggle.IsEnabled = true;
-        GameFilterToggle.IsChecked = isGameFilterActive;
-
-        if (ScenarioGameOptionsPanel != null)
+        try
         {
-            // Options are editable only when Game Filter is inactive and no operation is running
-            ScenarioGameOptionsPanel.IsEnabled = !isGameFilterActive;
-            ScenarioGameOptionsPanel.Opacity = isGameFilterActive ? 0.5 : 1.0;
-        }
+            GameFilterToggle.IsEnabled = canChangeGameFilter;
+            GameFilterToggle.IsHitTestVisible = canChangeGameFilter;
+            GameFilterToggle.Focusable = canChangeGameFilter;
+            GameFilterToggle.IsTabStop = canChangeGameFilter;
+            GameFilterToggle.IsChecked = isGameFilterActive;
 
-        if (GameFilterLockedHint != null)
+            if (ScenarioGameOptionsPanel != null)
+            {
+                // Options are editable only when Game Filter is inactive and no operation is running
+                ScenarioGameOptionsPanel.IsEnabled = canEditOptions;
+                ScenarioGameOptionsPanel.Opacity = canEditOptions ? 1.0 : 0.5;
+            }
+
+            if (GameFilterLockedHint != null)
+            {
+                GameFilterLockedHint.Visibility = isGameFilterActive ? System.Windows.Visibility.Visible : System.Windows.Visibility.Collapsed;
+            }
+
+            ScenarioStatusBadge.BorderThickness = new System.Windows.Thickness(0);
+            ScenarioStatusBadge.BorderBrush = null;
+        }
+        finally
         {
-            GameFilterLockedHint.Visibility = isGameFilterActive ? System.Windows.Visibility.Visible : System.Windows.Visibility.Collapsed;
+            _suppressGameFilterToggleEvents = false;
         }
-
-        ScenarioStatusBadge.BorderThickness = new System.Windows.Thickness(0);
-        ScenarioStatusBadge.BorderBrush = null;
 
         if (isGameFilterActive)
         {
@@ -2003,18 +2393,19 @@ public partial class MainWindow : Window
         else
         {
             // Only overwrite if it isn't currently displaying a failure state (handled directly in error path)
-            if (ApplyGameFilterStatusText.Text != "Не удалось включить" && 
-                ApplyGameFilterStatusText.Text != "Не удалось выключить" && 
-                ApplyGameFilterStatusText.Text != "Не удалось применить" && 
-                ApplyGameFilterStatusText.Text != "Список недоступен" && 
-                ApplyGameFilterStatusText.Text != "zapret не установлен")
+            bool isInstalled = Settings.IsZapretInstalled && !string.IsNullOrEmpty(AppPaths.ZapretDirectory) && System.IO.Directory.Exists(AppPaths.ZapretDirectory);
+            if (ApplyGameFilterStatusText.Text != "Не удалось включить" &&
+                ApplyGameFilterStatusText.Text != "Не удалось выключить" &&
+                ApplyGameFilterStatusText.Text != "Не удалось применить" &&
+                ApplyGameFilterStatusText.Text != "Список недоступен" &&
+                (isInstalled || ApplyGameFilterStatusText.Text != "zapret не установлен"))
             {
                 ApplyGameFilterStatusText.Text = "Неактивен";
                 ApplyGameFilterStatusText.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "TextSecondaryBrush");
                 ScenarioStatusBadge.SetResourceReference(System.Windows.Controls.Border.BackgroundProperty, "BorderSoftBrush");
             }
         }
-        
+
         _suppressGameFilterToggleEvents = false;
     }
 
@@ -2022,10 +2413,10 @@ public partial class MainWindow : Window
     {
         if (ApplyGameFilterStatusText == null || ScenarioStatusBadge == null) return;
         ApplyGameFilterStatusText.Text = message;
-        
+
         ScenarioStatusBadge.BorderThickness = new System.Windows.Thickness(0);
         ScenarioStatusBadge.BorderBrush = null;
-        
+
         if (isError)
         {
             ApplyGameFilterStatusText.SetResourceReference(System.Windows.Controls.TextBlock.ForegroundProperty, "DangerBrush");
@@ -2204,6 +2595,11 @@ public partial class MainWindow : Window
 
     private async Task ApplyScenarioSettingsAsync()
     {
+        if (_isWizardRunning)
+        {
+            AppLogger.Info("Blocked ApplyScenarioSettingsAsync while auto-pick is active.");
+            return;
+        }
         if (_isGameFilterOperationRunning) return;
         _isGameFilterOperationRunning = true;
 
@@ -2848,13 +3244,17 @@ public partial class MainWindow : Window
 
         // 2. Update Version summary
         ExpertVersionSummaryText.Text = string.IsNullOrWhiteSpace(Settings.InstalledZapretVersion)
-            ? "zapret не установлен"
+            ? (Settings.IsZapretInstalled ? "Версия не определена · актуальность не проверена" : "zapret не установлен")
             : $"zapret {Settings.InstalledZapretVersion}";
 
         // 3. Discover profiles
         if (isInstalled)
         {
-            var profiles = _profileService.GetAvailableProfiles();
+            var profiles = _profileService.GetAvailableProfiles()
+                .OrderBy(p => GetProfileSortKey(p.FileName).family)
+                .ThenBy(p => GetProfileSortKey(p.FileName).altNum)
+                .ThenBy(p => GetProfileSortKey(p.FileName).name)
+                .ToList();
 
             if (profiles.Count > 0)
             {
@@ -2936,89 +3336,199 @@ public partial class MainWindow : Window
     private async void ProfileComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (!_isInitialized || _isSyncingProfiles || _isApplyingProfile) return;
-        if (ProfileComboBox.SelectedItem is ZapretProfileInfo profile)
+        if (_isWizardRunning)
         {
-            if (profile.FileName == _lastAppliedProfile) return;
-
-            _isApplyingProfile = true;
+            AppLogger.Info("Blocked ProfileComboBox_SelectionChanged while auto-pick is active.");
+            _isSyncingProfiles = true;
             try
             {
-                _isSyncingProfiles = true;
-                HomeProfileComboBox.SelectedItem = profile;
-                _isSyncingProfiles = false;
-
-                Settings.SelectedProfile = profile.FileName;
-                SafeSaveSettings();
-
-                ExpertSummaryText.Text = $"Текущий профиль: {profile.DisplayName}";
-                AppLogger.Info($"Эксперт: смена профиля на {profile.DisplayName}. Применяем немедленно.");
-
-                var status = await Task.Run(() => _statusService.GetStatus());
-                await _serviceManager.ReinstallAsync();
-                if (status.IsRunning) await _serviceManager.StartAsync();
-
-                _lastAppliedProfile = profile.FileName;
-                SetFooterMessage($"Профиль {profile.DisplayName} применён", FooterMessageKind.Success, highlight: true);
-
-                ParseSelectedProfile(profile.FullPath);
-                _ = ExecuteNetworkDiagnosticAsync(false);
-            }
-            catch (Exception ex)
-            {
-                AppLogger.Error($"Ошибка при смене профиля: {ex.Message}");
-                SetFooterMessage("Ошибка при смене профиля", FooterMessageKind.Error, highlight: true);
+                string? targetProfile = !string.IsNullOrEmpty(_originalProfileBeforeWizard)
+                    ? _originalProfileBeforeWizard
+                    : _lastAppliedProfile;
+                ProfileComboBox.SelectedItem = ProfileComboBox.Items.Cast<ZapretProfileInfo>().FirstOrDefault(p => p.FileName == targetProfile);
             }
             finally
             {
-                _isApplyingProfile = false;
-                UpdateWindowTitleBar();
+                _isSyncingProfiles = false;
             }
+            return;
+        }
+        if (!_isInitialized || _isSyncingProfiles || _isApplyingProfile) return;
+        if (ProfileComboBox.SelectedItem is ZapretProfileInfo profile)
+        {
+            if (profile.FileName == _lastAppliedProfile) return;
+            await ApplyProfileCoreAsync(profile, "Эксперт");
         }
     }
 
     private async void HomeProfileComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (!_isInitialized || _isSyncingProfiles || _isApplyingProfile) return;
-        if (HomeProfileComboBox.SelectedItem is ZapretProfileInfo profile)
+        if (_isWizardRunning)
         {
-            if (profile.FileName == _lastAppliedProfile) return;
-
-            _isApplyingProfile = true;
+            AppLogger.Info("Blocked HomeProfileComboBox_SelectionChanged while auto-pick is active.");
+            _isSyncingProfiles = true;
             try
             {
-                _isSyncingProfiles = true;
-                ProfileComboBox.SelectedItem = profile;
-                _isSyncingProfiles = false;
-
-                Settings.SelectedProfile = profile.FileName;
-                SafeSaveSettings();
-
-                ExpertSummaryText.Text = $"Текущий профиль: {profile.DisplayName}";
-                AppLogger.Info($"Главная: смена профиля на {profile.DisplayName}. Применяем немедленно.");
-
-                var status = await Task.Run(() => _statusService.GetStatus());
-                await _serviceManager.ReinstallAsync();
-                if (status.IsRunning) await _serviceManager.StartAsync();
-
-                _lastAppliedProfile = profile.FileName;
-                SetFooterMessage($"Профиль {profile.DisplayName} применён", FooterMessageKind.Success, highlight: true);
-
-                ParseSelectedProfile(profile.FullPath);
-                _ = ExecuteNetworkDiagnosticAsync(false);
-            }
-            catch (Exception ex)
-            {
-                AppLogger.Error($"Ошибка при смене профиля: {ex.Message}");
-                SetFooterMessage("Ошибка при смене профиля", FooterMessageKind.Error, highlight: true);
+                string? targetProfile = !string.IsNullOrEmpty(_originalProfileBeforeWizard)
+                    ? _originalProfileBeforeWizard
+                    : _lastAppliedProfile;
+                HomeProfileComboBox.SelectedItem = HomeProfileComboBox.Items.Cast<ZapretProfileInfo>().FirstOrDefault(p => p.FileName == targetProfile);
             }
             finally
             {
-                _isApplyingProfile = false;
-                UpdateWindowTitleBar();
+                _isSyncingProfiles = false;
             }
+            return;
+        }
+        if (!_isInitialized || _isSyncingProfiles || _isApplyingProfile) return;
+        if (HomeProfileComboBox.SelectedItem is ZapretProfileInfo profile)
+        {
+            if (profile.FileName == _lastAppliedProfile) return;
+            await ApplyProfileCoreAsync(profile, "Главная");
         }
     }
 
+    private async Task ApplyProfileCoreAsync(ZapretProfileInfo profile, string sourceName)
+    {
+        if (profile == null || string.IsNullOrWhiteSpace(profile.FileName) || string.IsNullOrWhiteSpace(profile.FullPath))
+        {
+            AppLogger.Error($"{sourceName}: попытка применить пустой профиль отклонена.");
+            throw new ArgumentException("Недопустимый профиль.");
+        }
+
+        if (profile.FileName.Equals("service.bat", StringComparison.OrdinalIgnoreCase))
+        {
+            AppLogger.Error($"{sourceName}: попытка применить service.bat отклонена.");
+            throw new InvalidOperationException("Выбор service.bat запрещён.");
+        }
+
+        var availableProfiles = _profileService.GetAvailableProfiles();
+        var match = availableProfiles.FirstOrDefault(p => p.FileName.Equals(profile.FileName, StringComparison.OrdinalIgnoreCase));
+        if (match == null)
+        {
+            AppLogger.Error($"{sourceName}: профиль {profile.FileName} не найден на диске.");
+            throw new FileNotFoundException("Профиль не найден.");
+        }
+
+        _isApplyingProfile = true;
+
+        string previousSelectedProfile = Settings.SelectedProfile;
+        string? previousLastAppliedProfile = _lastAppliedProfile;
+
+        // Verify service state before touching anything
+        var status = await Task.Run(() => _statusService.GetStatus());
+        bool wasRunning = status.IsRunning;
+
+        try
+        {
+            AppLogger.Info($"{sourceName}: смена профиля на {match.DisplayName}. Запуск применения...");
+
+            // 1. In memory only for ReinstallAsync
+            Settings.SelectedProfile = match.FileName;
+
+            // 2. Perform actions
+            await _serviceManager.ReinstallAsync();
+            if (wasRunning)
+            {
+                await _serviceManager.StartAsync();
+            }
+
+            // 3. Success -> apply UI and persistence
+            _lastAppliedProfile = match.FileName;
+            SafeSaveSettings();
+
+            // Synchronize combo boxes without triggering recursion
+            _isSyncingProfiles = true;
+            try
+            {
+                if (sourceName == "Эксперт" || sourceName == "Сравнение") HomeProfileComboBox.SelectedItem = match;
+                if (sourceName == "Главная" || sourceName == "Сравнение") ProfileComboBox.SelectedItem = match;
+            }
+            finally
+            {
+                _isSyncingProfiles = false;
+            }
+
+            ExpertSummaryText.Text = $"Текущий профиль: {match.DisplayName}";
+            SetFooterMessage($"Профиль {match.DisplayName} применён", FooterMessageKind.Success, highlight: true);
+
+            ParseSelectedProfile(match.FullPath);
+            UpdateWorkModeVisuals();
+            UpdateGameSettingsVisuals();
+            UpdateScenarioStatusUi();
+
+            _ = ExecuteNetworkDiagnosticAsync(false);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error($"Ошибка при смене профиля: {ex.GetType().Name} - {ex.Message}");
+            // Rollback in memory
+            // Rollback in memory
+            Settings.SelectedProfile = previousSelectedProfile;
+            _lastAppliedProfile = previousLastAppliedProfile;
+
+            // Sync combos back to previous state
+            _isSyncingProfiles = true;
+            try
+            {
+                var previousProfileInfo = availableProfiles.FirstOrDefault(p => p.FileName.Equals(previousSelectedProfile, StringComparison.OrdinalIgnoreCase));
+                HomeProfileComboBox.SelectedItem = previousProfileInfo;
+                ProfileComboBox.SelectedItem = previousProfileInfo;
+            }
+            finally
+            {
+                _isSyncingProfiles = false;
+            }
+
+            // Optional: try to safely rollback the service to the previous profile
+            if (!string.IsNullOrEmpty(previousSelectedProfile))
+            {
+                try
+                {
+                    AppLogger.Info($"Откат службы на предыдущий профиль: {previousSelectedProfile}");
+                    await _serviceManager.ReinstallAsync();
+                    if (wasRunning)
+                    {
+                        await _serviceManager.StartAsync();
+                    }
+                }
+                catch (Exception rollbackEx)
+                {
+                    AppLogger.Error($"Ошибка при откате службы: {rollbackEx.Message}");
+                }
+            }
+
+            // Do NOT throw to caller if we don't want caller to crash, but the caller handles it?
+            // "If applying the target fails ... 8. Log the exact exception type and message. 9. Do not call ClearOverlayState."
+            // We should re-throw so the caller sets button to Error without calling ClearOverlayState.
+            throw;
+        }
+        finally
+        {
+            _isApplyingProfile = false;
+            UpdateWindowTitleBar();
+        }
+    }
+
+    private void SyncProfileComboBoxes(string targetProfileName)
+    {
+        _isSyncingProfiles = true;
+        try
+        {
+            var target = _profileService.GetAvailableProfiles().FirstOrDefault(p => p.FileName.Equals(targetProfileName, StringComparison.OrdinalIgnoreCase));
+            if (target != null)
+            {
+                HomeProfileComboBox.SelectedItem = target;
+                ProfileComboBox.SelectedItem = target;
+                _lastAppliedProfile = target.FileName;
+            }
+        }
+        finally
+        {
+            _isSyncingProfiles = false;
+        }
+    }
 
     private void ParseSelectedProfile(string path)
     {
@@ -3398,7 +3908,22 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (_isWizardRunning || _installCts != null)
+            if (_isWizardRunning)
+            {
+                if (_wizardCts != null && !_wizardCts.IsCancellationRequested)
+                {
+                    AppLogger.Info("Запрошена отмена автоподбора через главную кнопку.");
+                    CancelCurrentOperation();
+                    ToggleButtonText.Text = "ОТМЕНА...";
+                    ToggleButton.IsEnabled = false;
+                }
+                else
+                {
+                    AppLogger.Info("Blocked bypass toggle while auto-pick is active or cancelling.");
+                }
+                return;
+            }
+            if (_installCts != null)
             {
                 CancelCurrentOperation();
                 return;
@@ -3513,6 +4038,127 @@ public partial class MainWindow : Window
 
     // ─── Главная — Install zapret ─────────────────────────────────────────────
 
+    private bool TryGetLocalZapretVersion(out string version)
+    {
+        version = string.Empty;
+        try
+        {
+            string serviceBatPath = System.IO.Path.Combine(AppPaths.ZapretDirectory, "service.bat");
+            if (!System.IO.File.Exists(serviceBatPath))
+            {
+                AppLogger.Warning("TryGetLocalZapretVersion: service.bat не найден.");
+                return false;
+            }
+
+            foreach (var line in System.IO.File.ReadLines(serviceBatPath))
+            {
+                string trimmed = line.Trim();
+                if (trimmed.StartsWith("set ", StringComparison.OrdinalIgnoreCase))
+                {
+                    string varPart = trimmed.Substring(4).TrimStart('"');
+                    if (varPart.StartsWith("LOCAL_VERSION=", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string val = varPart.Substring(14).TrimEnd('"');
+                        if (!string.IsNullOrWhiteSpace(val))
+                        {
+                            version = val.Trim();
+                            AppLogger.Info($"TryGetLocalZapretVersion: обнаружена версия {version}");
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            AppLogger.Warning("TryGetLocalZapretVersion: маркер LOCAL_VERSION не найден в service.bat.");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warning($"TryGetLocalZapretVersion: ошибка при чтении версии: {ex.Message}");
+            return false;
+        }
+    }
+
+    private void ReconcileZapretState()
+    {
+        bool serviceExists = false;
+        try
+        {
+            var status = _statusService.GetStatus();
+            serviceExists = status.Exists;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warning($"Reconcile: Ошибка получения статуса службы: {ex.Message}");
+        }
+
+        bool localValid = false;
+        try
+        {
+            localValid = _installer.ValidateLocalInstall();
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warning($"Reconcile: Ошибка проверки локальных файлов: {ex.Message}");
+        }
+
+        bool needsSave = false;
+
+        // State A: valid local files and Windows service exists -> IsZapretInstalled = true
+        if (localValid && serviceExists)
+        {
+            if (!Settings.IsZapretInstalled)
+            {
+                Settings.IsZapretInstalled = true;
+                needsSave = true;
+            }
+
+            if (string.IsNullOrWhiteSpace(Settings.InstalledZapretVersion))
+            {
+                if (TryGetLocalZapretVersion(out string version))
+                {
+                    Settings.InstalledZapretVersion = version;
+                    needsSave = true;
+                }
+            }
+        }
+        else
+        {
+            if (Settings.IsZapretInstalled)
+            {
+                Settings.IsZapretInstalled = false;
+                needsSave = true;
+            }
+
+            if (serviceExists && !localValid)
+            {
+                AppLogger.Warning("Reconcile: Несогласованное состояние - служба существует, но локальные файлы отсутствуют или повреждены.");
+            }
+        }
+
+        if (needsSave)
+        {
+            if (!SafeSaveSettings())
+            {
+                AppLogger.Warning("Reconcile: Не удалось сохранить обновленный статус установки.");
+            }
+        }
+    }
+
+    private ZapretProfileInfo? ResolveDefaultProfile()
+    {
+        var profiles = _profileService.GetAvailableProfiles()
+            .OrderBy(p => GetProfileSortKey(p.FileName).family)
+            .ThenBy(p => GetProfileSortKey(p.FileName).altNum)
+            .ThenBy(p => GetProfileSortKey(p.FileName).name)
+            .ToList();
+        if (profiles.Count == 0) return null;
+
+        return profiles.FirstOrDefault(p => !string.IsNullOrEmpty(Settings.SelectedProfile) && p.FileName.Equals(Settings.SelectedProfile, StringComparison.OrdinalIgnoreCase))
+               ?? profiles.FirstOrDefault(p => p.FileName.Equals("general (ALT11).bat", StringComparison.OrdinalIgnoreCase))
+               ?? profiles.FirstOrDefault();
+    }
+
     private async Task RunZapretInstallOrUpdateAsync()
     {
         if (_installCts != null) return; // Already running
@@ -3592,36 +4238,112 @@ public partial class MainWindow : Window
             await Task.Delay(1000, _installCts.Token);
             AppLogger.Info("Файлы готовы к замене.");
 
-            // 4. Run installer pipeline
-            var result = await _installer.InstallAsync(progress, _installCts.Token);
+            // 4. Local files preflight and GitHub fallback logic
+            progressReporter.Report(new InstallProgressInfo { Step = "Проверяем локальные файлы zapret..." });
+            bool localFilesValid = await Task.Run(() => _installer.ValidateLocalInstall());
+            AppLogger.Info($"Валидность локальных файлов: {localFilesValid}");
+
+            progressReporter.Report(new InstallProgressInfo { Step = "Проверяем актуальную версию..." });
+
+            GitHubReleaseInfo? remoteRelease = null;
+            bool githubUnavailable = false;
+            try
+            {
+                remoteRelease = await _releaseService.GetLatestReleaseAsync(_installCts.Token);
+            }
+            catch (OperationCanceledException) when (_installCts.Token.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is HttpRequestException || ex is InvalidOperationException)
+            {
+                githubUnavailable = true;
+                AppLogger.Error($"Ошибка при проверке GitHub: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error($"Неожиданная ошибка при проверке GitHub: {ex.Message}");
+                throw;
+            }
+
+            ZapretInstallResult result;
+
+            // Branch A
+            if (!localFilesValid)
+            {
+                if (githubUnavailable)
+                {
+                    result = ZapretInstallResult.Failed("Не удалось получить файлы zapret. GitHub временно недоступен");
+                }
+                else
+                {
+                    AppLogger.Info("Локальные файлы невалидны. Скачиваем с GitHub...");
+                    result = await _installer.InstallAsync(progress, _installCts.Token);
+                }
+            }
+            // Branch B
+            else if (remoteRelease != null)
+            {
+                bool localVersionIsTrustworthy = Settings.IsZapretInstalled && !string.IsNullOrWhiteSpace(Settings.InstalledZapretVersion);
+                string localVersion = localVersionIsTrustworthy ? Settings.InstalledZapretVersion : string.Empty;
+
+                if (localVersionIsTrustworthy && !IsNewerVersion(localVersion, remoteRelease.TagName))
+                {
+                    AppLogger.Info("Локальная версия актуальна или новее. Оставляем локальные файлы.");
+                    result = await AdoptValidatedLocalZapretAsync(progressReporter);
+                }
+                else
+                {
+                    AppLogger.Info(!localVersionIsTrustworthy
+                        ? "Локальная версия неизвестна или недостоверна. Скачиваем с GitHub..."
+                        : "Найдена более новая версия. Скачиваем с GitHub...");
+
+                    var remoteResult = await _installer.InstallAsync(progress, _installCts.Token);
+                    if (!remoteResult.Success)
+                    {
+                        AppLogger.Warning("Установка с GitHub не удалась. Откат к локальным файлам.");
+                        result = await AdoptValidatedLocalZapretAsync(progressReporter);
+                    }
+                    else
+                    {
+                        result = remoteResult;
+                    }
+                }
+            }
+            // Branch C
+            else
+            {
+                AppLogger.Info("GitHub временно недоступен — используются локальные файлы");
+                result = await AdoptValidatedLocalZapretAsync(progressReporter);
+            }
 
             if (result.Success)
             {
                 AppLogger.Info($"Файлы успешно установлены: {result.Version}");
 
-                // 4.5. Auto-select profile if none selected
-                if (string.IsNullOrEmpty(Settings.SelectedProfile))
-                {
-                    AppLogger.Info("Профиль не выбран. Пытаемся выбрать профиль по умолчанию...");
-                    var profiles = _profileService.GetAvailableProfiles();
-                    if (profiles.Count > 0)
-                    {
-                        var defaultProfile = profiles.FirstOrDefault(p => p.FileName.Equals("general (ALT11).bat", StringComparison.OrdinalIgnoreCase))
-                                           ?? profiles.FirstOrDefault(p => p.FileName.EndsWith(".bat", StringComparison.OrdinalIgnoreCase))
-                                           ?? profiles.FirstOrDefault();
+                // 4.5. Auto-select profile
+                var defaultProfile = ResolveDefaultProfile();
+                ZapretServiceActionResult svcResult;
 
-                        if (defaultProfile != null)
-                        {
-                            Settings.SelectedProfile = defaultProfile.FileName;
-                            SafeSaveSettings();
-                            AppLogger.Info($"Автоматически выбран профиль: {defaultProfile.FileName}");
-                        }
+                if (defaultProfile == null)
+                {
+                    AppLogger.Warning("Нет доступных профилей. Пропуск переустановки службы.");
+                    svcResult = ZapretServiceActionResult.Error("Не найдено ни одного профиля general*.bat.");
+                }
+                else
+                {
+                    if (Settings.SelectedProfile != defaultProfile.FileName)
+                    {
+                        Settings.SelectedProfile = defaultProfile.FileName;
+                        SafeSaveSettings();
+                        AppLogger.Info($"Автоматически выбран профиль: {defaultProfile.FileName}");
                     }
+
+                    // 5. Reinstall service to ensure binPath and everything is fresh
+                    progressReporter.Report(new InstallProgressInfo { Step = "Обновление службы..." });
+                    svcResult = await _serviceManager.ReinstallAsync();
                 }
 
-                // 5. Reinstall service to ensure binPath and everything is fresh
-                progressReporter.Report(new InstallProgressInfo { Step = "Обновление службы..." });
-                var svcResult = await _serviceManager.ReinstallAsync();
                 if (!svcResult.Success)
                 {
                     AppLogger.Warning($"Файлы обновлены, но не удалось переустановить службу: {svcResult.Message}");
@@ -3733,8 +4455,95 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task<ZapretInstallResult> AdoptValidatedLocalZapretAsync(IProgress<InstallProgressInfo> progressReporter)
+    {
+        progressReporter.Report(new InstallProgressInfo { Step = "Регистрация локальных файлов..." });
+
+        if (!await Task.Run(() => _installer.ValidateLocalInstall()))
+        {
+            return ZapretInstallResult.Failed("Не удалось подключить локальные файлы zapret");
+        }
+
+        var defaultProfile = ResolveDefaultProfile();
+
+        if (defaultProfile == null)
+        {
+            return ZapretInstallResult.Failed("Не найдены профили. Не удалось подключить локальные файлы zapret");
+        }
+
+        bool origIsInstalled = Settings.IsZapretInstalled;
+        string origProfile = Settings.SelectedProfile;
+        string origZapretPath = Settings.ZapretPath;
+        bool serviceConfirmed = false;
+
+        try
+        {
+            Settings.SelectedProfile = defaultProfile.FileName;
+            Settings.IsZapretInstalled = true;
+
+            if (_installCts != null && _installCts.Token.IsCancellationRequested)
+            {
+                throw new OperationCanceledException();
+            }
+
+            var svcResult = await _serviceManager.ReinstallAsync();
+            if (!svcResult.Success)
+            {
+                Settings.IsZapretInstalled = origIsInstalled;
+                Settings.SelectedProfile = origProfile;
+                Settings.ZapretPath = origZapretPath;
+                return ZapretInstallResult.Failed("Не удалось подключить локальные файлы zapret");
+            }
+
+            var status = await Task.Run(() => _statusService.GetStatus());
+            if (!status.Exists)
+            {
+                Settings.IsZapretInstalled = origIsInstalled;
+                Settings.SelectedProfile = origProfile;
+                Settings.ZapretPath = origZapretPath;
+                return ZapretInstallResult.Failed("Не удалось подключить локальные файлы zapret");
+            }
+
+            serviceConfirmed = true;
+            Settings.ZapretPath = AppPaths.ZapretDirectory;
+            if (TryGetLocalZapretVersion(out string localVer))
+            {
+                Settings.InstalledZapretVersion = localVer;
+            }
+            else
+            {
+                Settings.InstalledZapretVersion = string.Empty;
+            }
+
+            if (!SafeSaveSettings())
+            {
+                AppLogger.Warning("Zapret установлен, но настройки не удалось сохранить");
+                SetFooterMessage("Zapret установлен, но настройки не удалось сохранить", FooterMessageKind.Warning);
+            }
+
+            AppLogger.Info("Zapret установлен из локальных файлов");
+            string versionReport = string.IsNullOrWhiteSpace(Settings.InstalledZapretVersion) ? "" : Settings.InstalledZapretVersion;
+            return ZapretInstallResult.Successful(versionReport, AppPaths.ZapretDirectory);
+        }
+        catch
+        {
+            if (!serviceConfirmed)
+            {
+                Settings.IsZapretInstalled = origIsInstalled;
+                Settings.SelectedProfile = origProfile;
+                Settings.ZapretPath = origZapretPath;
+            }
+            throw;
+        }
+    }
+
     private async void InstallZapretButton_Click(object sender, RoutedEventArgs e)
     {
+        if (_isWizardRunning)
+        {
+            AppLogger.Info("Blocked InstallZapretButton_Click while auto-pick is active.");
+            return;
+        }
         await RunZapretInstallOrUpdateAsync();
     }
 
@@ -3766,17 +4575,151 @@ public partial class MainWindow : Window
         }
         else if (hasKmestuUpdate)
         {
-            // Only Kmestu update available
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "https://github.com/kmestu/ZapretKmestu/releases/latest",
-                UseShellExecute = true
-            });
+            // Only Kmestu update available — run real in-app update flow
+            await RunKmestuUpdateAsync();
         }
         else if (hasZapretUpdate)
         {
             // Only zapret update available
             await RunZapretInstallOrUpdateAsync();
+        }
+    }
+
+    // ─── Kmestu in-app update flow ────────────────────────────────────────────
+
+    /// <summary>
+    /// Downloads the latest ZapretKmestu.exe from GitHub, launches the dedicated
+    /// ZapretKmestu.Updater.exe process, then closes this application so the
+    /// updater can safely replace the running executable.
+    ///
+    /// On any failure the application keeps running and shows a status message.
+    /// No MessageBox is shown at any point.
+    /// </summary>
+    private async Task RunKmestuUpdateAsync()
+    {
+        if (_isKmestuUpdating)
+        {
+            AppLogger.Info("Обновление Kmestu уже выполняется.");
+            return;
+        }
+
+        // ── 1. Locate the bundled updater ────────────────────────────────────
+        string? updaterPath = AppUpdateService.FindUpdaterExecutable();
+        if (updaterPath == null)
+        {
+            AppLogger.Warning("ZapretKmestu.Updater.exe не найден рядом с приложением.");
+            SetFooterMessage("Обновление недоступно: файл обновления не найден.", FooterMessageKind.Error, highlight: true);
+            return;
+        }
+
+        // ── 2. Ensure we have a ZIP download URL ─────────────────────────────
+        if (string.IsNullOrWhiteSpace(_latestKmestuZipUrl))
+        {
+            AppLogger.Warning("URL для загрузки ZIP-архива Kmestu не определён. Попробуйте повторить проверку обновлений.");
+            SetFooterMessage("Нет ссылки на ZIP-архив обновления. Повторите проверку.", FooterMessageKind.Warning, highlight: true);
+            return;
+        }
+
+        _isKmestuUpdating = true;
+        UpdateUpdateStatusUi();
+
+        try
+        {
+            // ── 3. Download ZIP, extract safely, locate EXE ───────────────
+            string tag = _latestKmestuRelease ?? "update";
+            AppLogger.Info($"Начало загрузки ZIP-обновления Kmestu {tag} с {_latestKmestuZipUrl}");
+            SetFooterMessage($"Загрузка обновления {tag}…", FooterMessageKind.Info, highlight: true);
+
+            var progress = new Progress<InstallProgressInfo>(info =>
+            {
+                if (!string.IsNullOrEmpty(info.Step))
+                    Dispatcher.Invoke(() => SetFooterMessage(info.Step +
+                        (info.Percent.HasValue ? $" {info.Percent.Value}%" : "") +
+                        (info.Details != null ? $" · {info.Details}" : ""),
+                        FooterMessageKind.Info, suppressPulse: true));
+            });
+
+            // Derive the ZIP file name from the URL (or fall back to a safe default)
+            string zipFileName = Uri.TryCreate(_latestKmestuZipUrl, UriKind.Absolute, out var zipUri)
+                ? Path.GetFileName(zipUri.LocalPath)
+                : "ZapretKmestu.zip";
+            if (string.IsNullOrWhiteSpace(zipFileName))
+                zipFileName = "ZapretKmestu.zip";
+
+            string newExePath = await _appUpdateService.DownloadExtractAndLocateExeAsync(
+                _latestKmestuZipUrl, tag, zipFileName, progress).ConfigureAwait(false);
+
+            // ── 4. Validate downloaded file ────────────────────────────────
+            if (!File.Exists(newExePath) || new FileInfo(newExePath).Length == 0)
+            {
+                AppLogger.Error($"Загруженный файл повреждён или отсутствует: {newExePath}");
+                SetFooterMessage("Файл обновления повреждён. Попробуйте снова.", FooterMessageKind.Error, highlight: true);
+                return;
+            }
+
+            AppLogger.Info($"Файл обновления загружен: {newExePath} ({new FileInfo(newExePath).Length:N0} байт)");
+
+            // ── 5. Determine paths ─────────────────────────────────────────
+            string currentExePath = Environment.ProcessPath
+                ?? System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName
+                ?? Path.Combine(AppContext.BaseDirectory, "ZapretKmestu.exe");
+
+            string backupPath = currentExePath + ".backup";
+            int currentPid    = Environment.ProcessId;
+
+            AppLogger.Info($"Текущий EXE   : {currentExePath}");
+            AppLogger.Info($"Новый EXE     : {newExePath}");
+            AppLogger.Info($"Резервная копия: {backupPath}");
+            AppLogger.Info($"PID            : {currentPid}");
+            AppLogger.Info($"Обновляющий   : {updaterPath}");
+
+            // ── 6. Build updater argument string ──────────────────────────
+            string updaterArgs = $"--pid {currentPid}" +
+                                 $" --current \"{currentExePath}\"" +
+                                 $" --new \"{newExePath}\"" +
+                                 $" --backup \"{backupPath}\"";
+
+            AppLogger.Info($"Запуск обновляющего процесса: {updaterPath} {updaterArgs}");
+            SetFooterMessage("Подготовка обновления… Приложение закроется.", FooterMessageKind.Info, highlight: true);
+
+            // Brief UI pause so the user sees the message before the window closes.
+            await Task.Delay(800).ConfigureAwait(false);
+
+            // ── 7. Launch updater and close this application ──────────────
+            var startInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName        = updaterPath,
+                Arguments       = updaterArgs,
+                UseShellExecute = false,
+                CreateNoWindow  = true
+            };
+
+            _installCts?.Cancel();
+
+            System.Diagnostics.Process.Start(startInfo);
+            AppLogger.Info("Обновляющий процесс запущен. Закрываем приложение.");
+
+            // Shut down cleanly — updater will wait for this process to exit.
+            Dispatcher.Invoke(() =>
+            {
+                _isReallyClosing = true;
+                System.Windows.Application.Current.Shutdown(0);
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            AppLogger.Info("Загрузка обновления Kmestu отменена.");
+            SetFooterMessage("Загрузка обновления отменена.", FooterMessageKind.Info, highlight: true);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error($"Ошибка при обновлении Kmestu: {ex.Message}");
+            SetFooterMessage("Ошибка загрузки обновления. Приложение продолжает работу.", FooterMessageKind.Error, highlight: true);
+        }
+        finally
+        {
+            _isKmestuUpdating = false;
+            Dispatcher.Invoke(() => UpdateUpdateStatusUi());
         }
     }
 
@@ -3980,6 +4923,11 @@ public partial class MainWindow : Window
 
     private async Task ExecuteNetworkDiagnosticAsync(bool isManualCheck)
     {
+        if (_isWizardRunning)
+        {
+            AppLogger.Info("Blocked ExecuteNetworkDiagnosticAsync while auto-pick is active.");
+            return;
+        }
         if (!Settings.UseDiagnostics) return;
         if (_isNetworkCheckRunning)
         {
@@ -4281,6 +5229,82 @@ public partial class MainWindow : Window
         AppLogger.Info("Мастер подбора: показан выбор режима в оверлее (Быстрый/Точный).");
     }
 
+    private void SetAutoPickInteractionState(bool active)
+    {
+        bool enable = !active;
+
+        if (GameFilterToggle != null)
+        {
+            GameFilterToggle.IsEnabled = enable;
+            GameFilterToggle.IsHitTestVisible = enable;
+            GameFilterToggle.Focusable = enable;
+            GameFilterToggle.IsTabStop = enable;
+        }
+        if (GameFilterUdpButton != null) GameFilterUdpButton.IsEnabled = enable;
+        if (GameFilterTcpButton != null) GameFilterTcpButton.IsEnabled = enable;
+        if (GameFilterTcpUdpButton != null) GameFilterTcpUdpButton.IsEnabled = enable;
+        if (GameScopeListsButton != null) GameScopeListsButton.IsEnabled = enable;
+        if (GameScopeExtendedButton != null) GameScopeExtendedButton.IsEnabled = enable;
+        if (GameScopeAllButton != null) GameScopeAllButton.IsEnabled = enable;
+
+        if (active)
+        {
+            if (HomeProfileComboBox != null) HomeProfileComboBox.IsEnabled = false;
+            if (ProfileComboBox != null) ProfileComboBox.IsEnabled = false;
+
+            if (ReinstallServiceButton != null) ReinstallServiceButton.IsEnabled = false;
+            if (FixAllButton != null) FixAllButton.IsEnabled = false;
+            if (InstallZapretButton != null) InstallZapretButton.IsEnabled = false;
+            if (UninstallAppButton != null) UninstallAppButton.IsEnabled = false;
+            if (CheckConnectionButton != null) CheckConnectionButton.IsEnabled = false;
+            if (BestProfileButton != null) BestProfileButton.IsEnabled = false;
+
+            if (GameFilterToggle != null) GameFilterToggle.Opacity = 0.5;
+
+            if (YouTubeGraphPausedState != null) YouTubeGraphPausedState.Visibility = Visibility.Visible;
+            if (DiscordGraphPausedState != null) DiscordGraphPausedState.Visibility = Visibility.Visible;
+            if (YouTubeGraphPlaceholderText != null) YouTubeGraphPlaceholderText.Visibility = Visibility.Collapsed;
+            if (DiscordGraphPlaceholderText != null) DiscordGraphPlaceholderText.Visibility = Visibility.Collapsed;
+            if (YouTubeGraphContainer != null) YouTubeGraphContainer.Visibility = Visibility.Collapsed;
+            if (DiscordGraphContainer != null) DiscordGraphContainer.Visibility = Visibility.Collapsed;
+
+            if (YouTubeLatencyBadge != null) YouTubeLatencyBadge.Visibility = Visibility.Collapsed;
+            if (YouTubeQualityBadge != null) YouTubeQualityBadge.Visibility = Visibility.Collapsed;
+            if (YouTubeStatusText != null) YouTubeStatusText.Visibility = Visibility.Collapsed;
+
+            if (DiscordLatencyBadge != null) DiscordLatencyBadge.Visibility = Visibility.Collapsed;
+            if (DiscordQualityBadge != null) DiscordQualityBadge.Visibility = Visibility.Collapsed;
+            if (DiscordStatusText != null) DiscordStatusText.Visibility = Visibility.Collapsed;
+
+            SyncGameFilterUiFromActualState(isBusy: true, busyStatus: "Недоступно во время автоподбора");
+        }
+        else
+        {
+            if (GameFilterToggle != null) GameFilterToggle.Opacity = 1.0;
+            if (YouTubeGraphPausedState != null) YouTubeGraphPausedState.Visibility = Visibility.Collapsed;
+            if (DiscordGraphPausedState != null) DiscordGraphPausedState.Visibility = Visibility.Collapsed;
+            if (YouTubeGraphContainer != null) YouTubeGraphContainer.Visibility = Visibility.Visible;
+            if (DiscordGraphContainer != null) DiscordGraphContainer.Visibility = Visibility.Visible;
+
+            if (YouTubeStatusText != null) YouTubeStatusText.Visibility = Visibility.Visible;
+            if (DiscordStatusText != null) DiscordStatusText.Visibility = Visibility.Visible;
+
+            SyncGameFilterUiFromActualState();
+
+            if (InstallZapretButton != null) InstallZapretButton.IsEnabled = _installCts == null;
+
+            var currentStatus = _statusService.GetStatus();
+            ApplyStatusToUi(currentStatus, _lastVpnActive, false);
+        }
+
+        if (active)
+        {
+            CloseUpdateCenterPopup();
+        }
+
+        UpdateUpdateStatusUi();
+    }
+
     private async Task RunBestProfileWizardAsync(ProfileCheckMode mode)
     {
         if (_isWizardRunning)
@@ -4293,6 +5317,8 @@ public partial class MainWindow : Window
         AppLogger.Info($"=== Запуск мастера подбора профиля (Режим: {mode}) ===");
 
         _isWizardRunning = true;
+        _wizardCompletionTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        SetAutoPickInteractionState(true);
         _suppressWizardFooterNoise = true;
         _autopickStartTime = DateTime.Now;
         _wizardCts = new CancellationTokenSource();
@@ -4330,13 +5356,13 @@ public partial class MainWindow : Window
 
             if (mode == ProfileCheckMode.Fast)
             {
-                candidates = BuildFastProfileCandidateList(allProfiles);
+                candidates = BuildProfileCandidateList(allProfiles);
                 AppLogger.Info($"Быстрый подбор: сформирован список кандидатов: {candidates.Count} из {allProfiles.Count}.");
             }
             else
             {
                 // Accurate mode tests all
-                candidates = allProfiles;
+                candidates = BuildProfileCandidateList(allProfiles);
             }
 
             if (candidates.Count == 0)
@@ -4344,7 +5370,6 @@ public partial class MainWindow : Window
 
             AppLogger.Info($"Всего кандидатов для проверки: {candidates.Count}");
 
-            ProfileCheckResult? bestResult = null;
             List<ProfileCheckResult> results = new();
 
             // 2. Loop candidates
@@ -4353,8 +5378,8 @@ public partial class MainWindow : Window
                 token.ThrowIfCancellationRequested();
 
                 string profile = candidates[i];
-                double overallBase = (double)i / candidates.Count * 100;
-                double stepSize = 100.0 / candidates.Count;
+                double overallBase = (double)i / candidates.Count * 90;
+                double stepSize = 90.0 / candidates.Count;
 
                 var currentResult = new ProfileCheckResult { ProfileName = profile };
                 var startTime = DateTime.Now;
@@ -4382,35 +5407,34 @@ public partial class MainWindow : Window
                 UpdateWizardStatus(overallBase + (stepSize * 0.25), warmupStep, results, candidates.Count);
                 await Task.Delay(warmUpDelay, token);
 
-                // Sub-step: YouTube Checks
+                // Sub-step: Probes
                 token.ThrowIfCancellationRequested();
-                string ytStep = (mode == ProfileCheckMode.Accurate ? $"Точная проверка {i + 1} из {candidates.Count}: {profile}\n" : "") + "Проверка YouTube...";
-                UpdateWizardStatus(overallBase + (stepSize * 0.45), ytStep, results, candidates.Count);
+                string probeStep = (mode == ProfileCheckMode.Accurate ? $"Точная проверка {i + 1} из {candidates.Count}: {profile}\n" : "") + "Проверка ресурсов...";
+                UpdateWizardStatus(overallBase + (stepSize * 0.45), probeStep, results, candidates.Count);
 
-                var ytProbe = await PerformMultiProbeCheckAsync(
+                var ytTask = PerformMultiProbeCheckAsync(
                     "YouTube",
-                    new[] { "https://www.youtube.com/generate_204", "https://www.youtube.com/s/desktop/288f343a/css/extensions.css" },
+                    new[] { "https://www.youtube.com/generate_204", "https://i.ytimg.com/generate_204" },
                     new[] { 30, 20 },
                     mode == ProfileCheckMode.Fast ? 5000 : 10000,
                     mode == ProfileCheckMode.Fast ? 1 : 2,
                     token);
 
-                currentResult.YouTubeAvailable = ytProbe.available;
-                currentResult.YouTubeScore = ytProbe.score;
-                if (!string.IsNullOrEmpty(ytProbe.errors)) currentResult.Errors += ytProbe.errors + "; ";
-
-                // Sub-step: Discord Checks
-                token.ThrowIfCancellationRequested();
-                string dsStep = (mode == ProfileCheckMode.Accurate ? $"Точная проверка {i + 1} из {candidates.Count}: {profile}\n" : "") + "Проверка Discord...";
-                UpdateWizardStatus(overallBase + (stepSize * 0.75), dsStep, results, candidates.Count);
-
-                var dsProbe = await PerformMultiProbeCheckAsync(
+                var dsTask = PerformMultiProbeCheckAsync(
                     "Discord",
                     new[] { "https://discord.com/api/v10/gateway", "https://discordapp.com/api/v9/experiments" },
                     new[] { 30, 20 },
                     mode == ProfileCheckMode.Fast ? 5000 : 10000,
                     mode == ProfileCheckMode.Fast ? 1 : 2,
                     token);
+
+                await Task.WhenAll(ytTask, dsTask);
+                var ytProbe = ytTask.Result;
+                var dsProbe = dsTask.Result;
+
+                currentResult.YouTubeAvailable = ytProbe.available;
+                currentResult.YouTubeScore = ytProbe.score;
+                if (!string.IsNullOrEmpty(ytProbe.errors)) currentResult.Errors += ytProbe.errors + "; ";
 
                 currentResult.DiscordAvailable = dsProbe.available;
                 currentResult.DiscordScore = dsProbe.score;
@@ -4419,109 +5443,94 @@ public partial class MainWindow : Window
                 currentResult.SuccessCount = ytProbe.successCount + dsProbe.successCount;
                 currentResult.TotalProbes = ytProbe.totalProbes + dsProbe.totalProbes;
                 currentResult.CheckDuration = DateTime.Now - startTime;
+                currentResult.WasConfirmationChecked = mode == ProfileCheckMode.Accurate;
                 results.Add(currentResult);
 
                 AppLogger.Info($"Результат {profile}: YT={currentResult.YouTubeScore}, DS={currentResult.DiscordScore}, Total={currentResult.TotalScore}");
-
-                if (bestResult == null || currentResult.TotalScore > bestResult.TotalScore)
-                {
-                    bestResult = currentResult;
-                }
 
                 // Sub-step: Stop
                 string stopStep = (mode == ProfileCheckMode.Accurate ? $"Точная проверка {i + 1} из {candidates.Count}: {profile}\n" : "") + "Остановка...";
                 UpdateWizardStatus(overallBase + (stepSize * 0.95), stopStep, results, candidates.Count);
                 await _serviceManager.StopAsync();
+            }
 
-                // Early stop in Fast mode only after a minimum number of candidates have been compared
-                int minimumFastCandidatesToCheck = Math.Min(3, candidates.Count);
-                bool canStopFastMode =
-                    mode == ProfileCheckMode.Fast
-                    && i + 1 >= minimumFastCandidatesToCheck
-                    && currentResult.IsPerfect
-                    && currentResult.TotalScore >= 90;
-
-                if (canStopFastMode)
+            // Accurate mode: re-test tied leaders
+            if (mode == ProfileCheckMode.Accurate && results.Count > 0 && !token.IsCancellationRequested)
+            {
+                long maxAccurateScore = results.Max(r => GetMeasuredRankingScore(r));
+                if (maxAccurateScore > 0)
                 {
-                    AppLogger.Info("Быстрый подбор: найден устойчивый профиль после минимального сравнения.");
-                    break;
+                    var finalists = results.Where(r => GetMeasuredRankingScore(r) == maxAccurateScore && (r.YouTubeAvailable || r.DiscordAvailable)).ToList();
+                    AppLogger.Info($"Точный подбор: повторная проверка {finalists.Count} финалист(ов): {string.Join(", ", finalists.Select(f => f.ProfileName))}");
+
+                    if (finalists.Count > 0)
+                    {
+                        var recheckResults = new List<(ProfileCheckResult Original, bool YtAvail, int YtScore, bool DsAvail, int DsScore, int Succ, int Probes)>();
+                        InstallStepText.Text = "Повторная проверка финалистов...";
+
+                        foreach (var finalist in finalists)
+                        {
+                            token.ThrowIfCancellationRequested();
+                            AppLogger.Info($"--- Повторная проверка финалиста: {finalist.ProfileName} ---");
+                            Settings.SelectedProfile = finalist.ProfileName;
+                            await _serviceManager.ReinstallAsync();
+                            await _serviceManager.StartAsync();
+                            await Task.Delay(4500, token);
+
+                            var ytRecheckTask = PerformMultiProbeCheckAsync(
+                                "YouTube",
+                                new[] { "https://www.youtube.com/generate_204" },
+                                new[] { 30 },
+                                10000, 2, token);
+
+                            var dsRecheckTask = PerformMultiProbeCheckAsync(
+                                "Discord",
+                                new[] { "https://discord.com/api/v10/gateway" },
+                                new[] { 30 },
+                                10000, 2, token);
+
+                            await Task.WhenAll(ytRecheckTask, dsRecheckTask);
+                            var ytRecheck = ytRecheckTask.Result;
+                            var dsRecheck = dsRecheckTask.Result;
+
+                            await _serviceManager.StopAsync();
+                            recheckResults.Add((finalist, ytRecheck.available, ytRecheck.score, dsRecheck.available, dsRecheck.score, ytRecheck.successCount + dsRecheck.successCount, ytRecheck.totalProbes + dsRecheck.totalProbes));
+                        }
+
+                        // Update finalists with new scores
+                        foreach (var rr in recheckResults)
+                        {
+                            rr.Original.YouTubeAvailable = rr.YtAvail;
+                            rr.Original.DiscordAvailable = rr.DsAvail;
+                            rr.Original.YouTubeScore = rr.YtScore;
+                            rr.Original.DiscordScore = rr.DsScore;
+                            rr.Original.SuccessCount = rr.Succ;
+                            rr.Original.TotalProbes = rr.Probes;
+                        }
+                    }
                 }
             }
 
-            // Accurate mode: re-test top-3 finalists and select final winner from re-check results
-            if (mode == ProfileCheckMode.Accurate && results.Count > 0 && bestResult != null && !token.IsCancellationRequested)
+            long maxFinalScore = results.Count > 0 ? results.Max(r => GetMeasuredRankingScore(r)) : 0;
+            var tiedLeaders = results.Where(r => GetMeasuredRankingScore(r) == maxFinalScore && maxFinalScore > 0 && (r.YouTubeAvailable || r.DiscordAvailable)).ToList();
+
+            foreach (var r in results)
             {
-                // Select finalists: up to top 3 with positive score and at least one service available
-                var finalists = results
-                    .Where(r => r.TotalScore > 0 && (r.YouTubeAvailable || r.DiscordAvailable))
-                    .OrderByDescending(r => r.TotalScore)
-                    .ThenBy(r => candidates.IndexOf(r.ProfileName))
-                    .Take(3)
-                    .ToList();
+                r.IsWinner = false;
+                r.IsTie = false;
+            }
 
-                AppLogger.Info($"Точный подбор: повторная проверка {finalists.Count} финалист(ов): {string.Join(", ", finalists.Select(f => f.ProfileName))}");
-
-                if (finalists.Count > 0)
+            if (tiedLeaders.Count == 1)
+            {
+                AppLogger.Info($"Единоличный лидер: {tiedLeaders[0].ProfileName}");
+                tiedLeaders[0].IsWinner = true;
+            }
+            else if (tiedLeaders.Count > 1)
+            {
+                AppLogger.Info($"После проверки осталось несколько лидеров. Устанавливаем статус IsTie = true.");
+                foreach (var leader in tiedLeaders)
                 {
-                    // Local record for re-check results
-                    var recheckResults = new List<(ProfileCheckResult Original, bool YtAvail, int YtScore, bool DsAvail, int DsScore)>();
-
-                    InstallStepText.Text = "Повторная проверка финалистов...";
-
-                    foreach (var finalist in finalists)
-                    {
-                        token.ThrowIfCancellationRequested();
-
-                        AppLogger.Info($"--- Повторная проверка финалиста: {finalist.ProfileName} ---");
-
-                        Settings.SelectedProfile = finalist.ProfileName;
-                        await _serviceManager.ReinstallAsync();
-                        await _serviceManager.StartAsync();
-                        await Task.Delay(4500, token);
-
-                        var ytRecheck = await PerformMultiProbeCheckAsync(
-                            "YouTube",
-                            new[] { "https://www.youtube.com/generate_204" },
-                            new[] { 30 },
-                            10000, 2, token);
-
-                        var dsRecheck = await PerformMultiProbeCheckAsync(
-                            "Discord",
-                            new[] { "https://discord.com/api/v10/gateway" },
-                            new[] { 30 },
-                            10000, 2, token);
-
-                        await _serviceManager.StopAsync();
-
-                        recheckResults.Add((finalist, ytRecheck.available, ytRecheck.score, dsRecheck.available, dsRecheck.score));
-                        AppLogger.Info($"Повторная проверка {finalist.ProfileName}: YT={ytRecheck.score} ({ytRecheck.available}), DS={dsRecheck.score} ({dsRecheck.available})");
-                    }
-
-                    // Choose final winner from re-check results:
-                    // 1. IsPerfect (both services) in re-check
-                    // 2. Higher re-check total score
-                    // 3. Higher original TotalScore
-                    // 4. Lower original CheckDuration
-                    // 5. Original candidate order (deterministic tie-breaker)
-                    var bestRecheck = recheckResults
-                        .Where(r => r.YtScore + r.DsScore > 0 && (r.YtAvail || r.DsAvail))
-                        .OrderByDescending(r => r.YtAvail && r.DsAvail ? 1 : 0)
-                        .ThenByDescending(r => r.YtScore + r.DsScore)
-                        .ThenByDescending(r => r.Original.TotalScore)
-                        .ThenBy(r => r.Original.CheckDuration)
-                        .ThenBy(r => candidates.IndexOf(r.Original.ProfileName))
-                        .FirstOrDefault();
-
-                    if (bestRecheck.Original != null)
-                    {
-                        bestResult = bestRecheck.Original;
-                        AppLogger.Info($"Точный подбор: победитель по повторной проверке — {bestResult.ProfileName} (re-check YT={bestRecheck.YtScore}, DS={bestRecheck.DsScore})");
-                    }
-                    else
-                    {
-                        // All re-checks failed: keep original bestResult, Stage 1 guard will evaluate it
-                        AppLogger.Warning("Точный подбор: все повторные проверки неудачны. Сохраняем исходного победителя для оценки Stage 1.");
-                    }
+                    leader.IsTie = true;
                 }
             }
 
@@ -4529,10 +5538,8 @@ public partial class MainWindow : Window
             InstallProgressBar.Value = 100;
             InstallPercentText.Text = "100%";
 
-            // Stage 1 safety: a result is only usable when it has a positive score
-            // and at least one service responded successfully. A zero-score candidate
-            // must never be presented as a winner, because Settings.SelectedProfile
-            // was mutated during the loop and must be restored in the failure path.
+            ProfileCheckResult? bestResult = results.FirstOrDefault(r => r.IsWinner);
+
             bool hasUsableBestResult =
                 bestResult != null
                 && bestResult.TotalScore > 0
@@ -4540,75 +5547,95 @@ public partial class MainWindow : Window
 
             _lastWizardResults = results.ToList();
             _lastWizardCompletedAt = DateTime.Now;
+
+            // Ensure IsWinner is only true if we have a usable bestResult. Otherwise, if there is a tie, no one is IsWinner.
             foreach (var item in _lastWizardResults)
             {
-                item.IsWinner = false;
+                if (item != bestResult)
+                    item.IsWinner = false;
             }
 
-            if (hasUsableBestResult)
+            _lastWizardResult = hasUsableBestResult ? bestResult : null;
+
+            SaveLastAutoPickResults();
+            UpdateLastWizardResultsButtonState();
+
+            if (hasUsableBestResult || tiedLeaders.Count > 1)
             {
-                // Mark winner in the comparison list
-                var winner = _lastWizardResults.FirstOrDefault(r => string.Equals(r.ProfileName, bestResult!.ProfileName, StringComparison.OrdinalIgnoreCase));
-                if (winner != null)
+                // 3. Handle Result UI
+                if (bestResult != null)
                 {
-                    winner.IsWinner = true;
+                    _bestProfileCandidate = bestResult.ProfileName;
+                    _bestProfileScore = bestResult.TotalScore;
+                    AppLogger.Info($"Мастер завершён. Результат показан в оверлее-таблице. Лучший: {bestResult.ProfileName}, Счёт: {bestResult.TotalScore}");
+                }
+                else
+                {
+                    _bestProfileCandidate = string.Empty;
+                    _bestProfileScore = -1;
+                    AppLogger.Info($"Мастер завершён. Результат показан в оверлее-таблице. Победителя нет (ничья).");
                 }
 
-                _lastWizardResult = bestResult;
-
-                // Save persisted auto-pick results to disk only for a usable run
-                SaveLastAutoPickResults();
-
-                UpdateLastWizardResultsButtonState();
-
-                // 3. Handle Result UI — usable winner found
-                _bestProfileCandidate = bestResult!.ProfileName;
-                _bestProfileScore = bestResult.TotalScore;
-
-                AppLogger.Info($"Мастер завершён. Результат показан в оверлее-таблице. Лучший: {bestResult.ProfileName}, Счёт: {bestResult.TotalScore}");
-
                 _suppressWizardFooterNoise = false;
-                SetFooterMessage("Профиль найден", FooterMessageKind.Success, highlight: true);
+                // RESTORE ORIGINAL PROFILE BEFORE OVERLAY
+                // RESTORE ORIGINAL PROFILE BEFORE OVERLAY
+                UpdateWizardStatus(90, "Восстанавливаем исходный профиль…", _lastWizardResults!, candidates.Count);
+                await RestoreBestProfileWizardOriginalState(_originalProfileBeforeWizard, _wasRunningBeforeWizard);
+                UpdateWizardStatus(100, "Готово", _lastWizardResults!, candidates.Count);
+
+                SetFooterMessage(bestResult != null ? "Профиль найден" : "Проверка завершена", FooterMessageKind.Success, highlight: true);
 
                 var overlayResult = await ShowFinalWizardResultsOverlayAsync(_lastWizardResults!, bestResult, mode, vpnWasActive);
 
                 if (overlayResult == OverlayResult.Primary)
                 {
-                    _isWizardRunning = false;
-                    SetLeftProfileBusyState(false);
-                    LastWizardResultsButton.IsEnabled = false;
-                    LastWizardResultsButton.Opacity = 0.5;
+                    if (bestResult != null &&
+                        bestResult.IsWinner &&
+                        !bestResult.IsTie &&
+                        !string.IsNullOrWhiteSpace(bestResult.ProfileName) &&
+                        !string.IsNullOrWhiteSpace(_bestProfileCandidate) &&
+                        _lastWizardResults!.Count(r => r.IsWinner) == 1)
+                    {
+                        SetLeftProfileBusyState(false);
+                        LastWizardResultsButton.IsEnabled = false;
+                        LastWizardResultsButton.Opacity = 0.5;
 
-                    try
-                    {
-                        Settings.SelectedProfile = _bestProfileCandidate;
-                        SafeSaveSettings();
-                        SetFooterMessage("Применение профиля…", FooterMessageKind.Info, highlight: false);
-                        await _serviceManager.ReinstallAsync();
-                        await _serviceManager.StartAsync();
-                        AppLogger.Info($"Мастер: профиль {_bestProfileCandidate} успешно применён.");
-                        SetFooterMessage("Профиль найден", FooterMessageKind.Success, highlight: true);
-                        _ = ExecuteNetworkDiagnosticAsync(false);
+                        try
+                        {
+                            Settings.SelectedProfile = _bestProfileCandidate;
+                            SafeSaveSettings();
+                            SetFooterMessage("Применение профиля…", FooterMessageKind.Info, highlight: false);
+                            await _serviceManager.ReinstallAsync();
+                            await _serviceManager.StartAsync();
+                            SyncProfileComboBoxes(_bestProfileCandidate);
+                            SyncProfileComboBoxes(_bestProfileCandidate);
+
+                            AppLogger.Info($"Мастер: профиль {_bestProfileCandidate} успешно применён.");
+                            SetFooterMessage("Профиль найден", FooterMessageKind.Success, highlight: true);
+                            _ = ExecuteNetworkDiagnosticAsync(false);
+                        }
+                        finally
+                        {
+                            UpdateLastWizardResultsButtonState();
+                        }
                     }
-                    finally
+                    else
                     {
-                        UpdateLastWizardResultsButtonState();
+                        AppLogger.Info("Мастер: пользователь нажал Готово во время ничьей.");
+                        SetFooterMessage("Преимущество не выявлено — текущий профиль сохранён", FooterMessageKind.Info, highlight: true);
                     }
                 }
                 else if (overlayResult == OverlayResult.Secondary)
                 {
-                    AppLogger.Info("Мастер: пользователь выбрал оставить старый профиль (явный выбор).");
-                    await RestoreBestProfileWizardOriginalState(_originalProfileBeforeWizard, _wasRunningBeforeWizard);
+                    AppLogger.Info("Мастер: пользователь выбрал оставить старый профиль (явный выбор или закрытие).");
                 }
                 else if (overlayResult == OverlayResult.Tertiary)
                 {
-                    await RestoreBestProfileWizardOriginalState(_originalProfileBeforeWizard, _wasRunningBeforeWizard);
                     await RunBestProfileWizardAsync(ProfileCheckMode.Accurate);
                 }
                 else
                 {
                     AppLogger.Info("Мастер: пользователь закрыл окно оверлея или отменил действие.");
-                    await RestoreBestProfileWizardOriginalState(_originalProfileBeforeWizard, _wasRunningBeforeWizard);
                 }
             }
             else
@@ -4619,29 +5646,11 @@ public partial class MainWindow : Window
                 _suppressWizardFooterNoise = false;
                 SetFooterMessage("Стабильный профиль не найден", FooterMessageKind.Warning, highlight: true);
 
-                _lastWizardResult = null;
-                // We do not save results or retain a misleading "Последний подбор" for a failed run.
-                if (_lastWizardResults != null)
-                {
-                    _lastWizardResults.Clear();
-                }
+                AppLogger.Info("Подбор завершился безрезультатно. Результаты сохранены.");
 
-                try
-                {
-                    if (File.Exists(AppPaths.LastAutoPickResultsFilePath))
-                    {
-                        File.Delete(AppPaths.LastAutoPickResultsFilePath);
-                        AppLogger.Info("Файл предыдущих результатов подбора удалён, так как текущий подбор не дал результатов.");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    AppLogger.Error($"Не удалось удалить файл результатов: {ex.Message}");
-                }
-
-                UpdateLastWizardResultsButtonState();
-
+                UpdateWizardStatus(90, "Восстанавливаем исходный профиль…", results, candidates.Count);
                 await RestoreBestProfileWizardOriginalState(_originalProfileBeforeWizard, _wasRunningBeforeWizard);
+                UpdateWizardStatus(100, "Готово", results, candidates.Count);
 
                 ShowOverlay(
                     "Не удалось подобрать профиль",
@@ -4662,13 +5671,28 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            AppLogger.Error($"Ошибка мастера подбора: {ex.Message}");
+            AppLogger.Error($"Ошибка мастера подбора: {ex.GetType().Name} - {ex.Message}");
             SetFooterMessage("Ошибка подбора профиля.", FooterMessageKind.Error, highlight: true);
             await RestoreBestProfileWizardOriginalState(_originalProfileBeforeWizard, _wasRunningBeforeWizard);
+            ShowOverlay(
+                "Ошибка во время подбора",
+                $"Произошла непредвиденная ошибка:\n{ex.Message}\n\nИсходный профиль восстановлен.",
+                "Понятно",
+                "",
+                () => { },
+                null,
+                closeBehavesAsPrimary: true
+            );
         }
         finally
         {
             _isWizardRunning = false;
+            SetAutoPickInteractionState(false);
+
+            var tcs = _wizardCompletionTcs;
+            _wizardCompletionTcs = null;
+            tcs?.TrySetResult();
+
             _autopickStartTime = null;
             UpdateConnectionDiagnosticSummary();
             _wizardCts?.Dispose();
@@ -4687,6 +5711,11 @@ public partial class MainWindow : Window
             RefreshExpertPage();
 
             _suppressWizardFooterNoise = false;
+
+            if (!_isReallyClosing)
+            {
+                _ = ExecuteNetworkDiagnosticAsync(false);
+            }
         }
     }
 
@@ -4707,75 +5736,46 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>
-    /// Builds a de-duplicated ordered candidate list for Fast-mode profile selection.
-    /// Priority order:
-    ///   1. Last successful auto-pick winner (_lastWizardResult.ProfileName)
-    ///   2. Currently selected profile (Settings.SelectedProfile)
-    ///   3. Discovered general (ALT...).bat files, sorted by ALT number descending
-    ///   4. Other general*.bat profiles not already added
-    ///   5. Up to 6 remaining profiles in discovery order
-    /// Duplicates are removed case-insensitively.
-    /// </summary>
-    private List<string> BuildFastProfileCandidateList(IReadOnlyList<string> allProfiles)
+    private static (int family, int altNum, string name) GetProfileSortKey(string filename)
     {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var result = new List<string>();
+        string lower = filename.ToLowerInvariant();
+        if (lower == "general.bat") return (1, 0, lower);
+        if (lower == "general (alt).bat") return (2, 0, lower);
+        var altMatch = System.Text.RegularExpressions.Regex.Match(lower, @"^general\s*\(alt(\d+)\)\.bat$");
+        if (altMatch.Success) return (3, int.Parse(altMatch.Groups[1].Value), lower);
+        if (lower == "general (fake tls auto).bat") return (4, 0, lower);
+        if (lower == "general (fake tls auto alt).bat") return (5, 0, lower);
+        var ftaAltMatch = System.Text.RegularExpressions.Regex.Match(lower, @"^general\s*\(fake tls auto alt(\d+)\)\.bat$");
+        if (ftaAltMatch.Success) return (6, int.Parse(ftaAltMatch.Groups[1].Value), lower);
+        if (lower == "general (simple fake).bat") return (7, 0, lower);
+        if (lower == "general (simple fake alt).bat") return (8, 0, lower);
+        var sfaAltMatch = System.Text.RegularExpressions.Regex.Match(lower, @"^general\s*\(simple fake alt(\d+)\)\.bat$");
+        if (sfaAltMatch.Success) return (9, int.Parse(sfaAltMatch.Groups[1].Value), lower);
+        return (10, 0, lower);
+    }
 
-        void TryAdd(string? name)
-        {
-            if (string.IsNullOrWhiteSpace(name)) return;
-            // Only add if it actually exists in the discovered profile set
-            var match = allProfiles.FirstOrDefault(p => p.Equals(name, StringComparison.OrdinalIgnoreCase));
-            if (match != null && seen.Add(match))
-                result.Add(match);
-        }
-
-        // 1. Last successful auto-pick winner (persisted across sessions)
-        TryAdd(_lastWizardResult?.ProfileName);
-
-        // 2. Currently selected profile
-        TryAdd(Settings.SelectedProfile);
-
-        // 3. All discovered general (ALT...).bat, sorted by ALT number descending
-        var altRegex = new Regex(@"general\s*\(ALT(\d+)\)\.bat", RegexOptions.IgnoreCase);
-        var altProfiles = allProfiles
-            .Select(p => (Profile: p, M: altRegex.Match(p)))
-            .Where(x => x.M.Success)
-            .OrderByDescending(x => int.Parse(x.M.Groups[1].Value))
-            .Select(x => x.Profile)
+    private List<string> BuildProfileCandidateList(IReadOnlyList<string> allProfiles)
+    {
+        var sorted = allProfiles
+            .OrderBy(p => GetProfileSortKey(p).family)
+            .ThenBy(p => GetProfileSortKey(p).altNum)
+            .ThenBy(p => GetProfileSortKey(p).name)
             .ToList();
-        foreach (var p in altProfiles)
-            TryAdd(p);
 
-        // 4. Other general*.bat profiles not already added (discovery order)
-        foreach (var p in allProfiles)
+        var result = new List<string>();
+        string currentProfile = Settings.SelectedProfile;
+
+        if (!string.IsNullOrEmpty(currentProfile))
         {
-            if (p.StartsWith("general", StringComparison.OrdinalIgnoreCase)
-                && p.EndsWith(".bat", StringComparison.OrdinalIgnoreCase)
-                && !seen.Contains(p))
+            var match = sorted.FirstOrDefault(p => p.Equals(currentProfile, StringComparison.OrdinalIgnoreCase));
+            if (match != null)
             {
-                TryAdd(p);
+                result.Add(match);
+                sorted.Remove(match);
             }
         }
 
-        // 5. Up to 6 remaining profiles in discovery order
-        const int maxFallback = 6;
-        int added = 0;
-        foreach (var p in allProfiles)
-        {
-            if (added >= maxFallback) break;
-            if (!seen.Contains(p))
-            {
-                TryAdd(p);
-                added++;
-            }
-        }
-
-        // Safety: if nothing was resolved fall back to the full list
-        if (result.Count == 0)
-            return allProfiles.ToList();
-
+        result.AddRange(sorted);
         return result;
     }
 
@@ -4827,28 +5827,54 @@ public partial class MainWindow : Window
                 return;
             }
 
-            // Pick winner: first item where IsWinner == true, or highest TotalScore if none
-            var winner = resultsList.FirstOrDefault(r => r.IsWinner);
-            if (winner == null)
+            // Stage 10 - LoadLastAutoPickResults: load IsTie and WasConfirmationChecked
+            // Do not manufacture a winner. Count winners.
+            var winners = resultsList.Where(r => r.IsWinner).ToList();
+
+            // Legacy normalization: If there is 1 winner, but another top result has identical measured evidence, treat as tie.
+            if (winners.Count == 1)
             {
-                winner = resultsList.OrderByDescending(r => r.TotalScore).FirstOrDefault();
+                var w = winners[0];
+                var tiedTop = resultsList.Where(r =>
+                    r != w &&
+                    r.YouTubeScore == w.YouTubeScore &&
+                    r.DiscordScore == w.DiscordScore &&
+                    r.SuccessCount == w.SuccessCount &&
+                    r.TotalProbes == w.TotalProbes &&
+                    r.YouTubeAvailable == w.YouTubeAvailable &&
+                    r.DiscordAvailable == w.DiscordAvailable).ToList();
+
+                if (tiedTop.Count > 0)
+                {
+                    AppLogger.Info("Legacy persistence: found matching top profiles. Converting to tie.");
+                    foreach (var r in resultsList)
+                    {
+                        r.IsWinner = false;
+                    }
+                    w.IsTie = true;
+                    foreach (var t in tiedTop)
+                    {
+                        t.IsTie = true;
+                    }
+                    winners.Clear();
+                }
             }
 
-            // Ensure exactly one winner is set to IsWinner = true, others false
-            foreach (var r in resultsList)
+            if (winners.Count > 1)
             {
-                r.IsWinner = false;
-            }
-            if (winner != null)
-            {
-                winner.IsWinner = true;
+                AppLogger.Warning("Corrupted in-memory data contains more than one IsWinner. Clearing winner flags.");
+                foreach (var r in resultsList)
+                {
+                    r.IsWinner = false;
+                }
+                winners.Clear();
             }
 
             _lastWizardResults = resultsList;
-            _lastWizardResult = winner;
+            _lastWizardResult = winners.Count == 1 ? winners[0] : null;
             _lastWizardCompletedAt = data.CompletedAt;
 
-            AppLogger.Info($"Last auto-pick results loaded. Profiles: {_lastWizardResults.Count}, completed at: {_lastWizardCompletedAt}");
+            AppLogger.Info($"Last auto-pick results loaded. Profiles: {_lastWizardResults.Count}, completed at: {_lastWizardCompletedAt}, IsWinner count: {winners.Count}");
         }
         catch (Exception ex)
         {
@@ -4903,29 +5929,10 @@ public partial class MainWindow : Window
                 TotalProbes = r.TotalProbes,
                 Errors = r.Errors,
                 CheckDuration = r.CheckDuration,
-                IsWinner = r.IsWinner
+                IsWinner = r.IsWinner,
+                IsTie = r.IsTie,
+                WasConfirmationChecked = r.WasConfirmationChecked
             }).ToList();
-
-            // Ensure exactly one IsWinner before writing:
-            // Prefer existing _lastWizardResult if it is present and matches by name
-            ProfileCheckResult? winner = null;
-            if (_lastWizardResult != null)
-            {
-                winner = resultsCopy.FirstOrDefault(r => string.Equals(r.ProfileName, _lastWizardResult.ProfileName, StringComparison.OrdinalIgnoreCase));
-            }
-            if (winner == null)
-            {
-                winner = resultsCopy.OrderByDescending(r => r.TotalScore).FirstOrDefault();
-            }
-
-            foreach (var r in resultsCopy)
-            {
-                r.IsWinner = false;
-            }
-            if (winner != null)
-            {
-                winner.IsWinner = true;
-            }
 
             var data = new LastAutoPickData
             {
@@ -4982,8 +5989,9 @@ public partial class MainWindow : Window
     private ComparisonSortColumn _currentComparisonSortCol = ComparisonSortColumn.Status;
     private ComparisonSortDirection _currentComparisonSortDir = ComparisonSortDirection.Descending;
     private bool _currentComparisonVpnWarning = false;
+    private string? _selectedComparisonProfile = null;
 
-    private async Task<OverlayResult> ShowFinalWizardResultsOverlayAsync(System.Collections.Generic.List<ProfileCheckResult> results, ProfileCheckResult bestResult, ProfileCheckMode mode, bool vpnWasActive)
+    private async Task<OverlayResult> ShowFinalWizardResultsOverlayAsync(System.Collections.Generic.List<ProfileCheckResult> results, ProfileCheckResult? bestResult, ProfileCheckMode mode, bool vpnWasActive)
     {
         _currentComparisonResults = results.ToList();
         _currentComparisonCompletedAt = _lastWizardCompletedAt;
@@ -4991,14 +5999,24 @@ public partial class MainWindow : Window
         _currentComparisonSortDir = ComparisonSortDirection.Descending;
         _currentComparisonVpnWarning = vpnWasActive;
 
-        string title = bestResult.IsPerfect
-            ? (mode == ProfileCheckMode.Accurate ? "Точная проверка завершена" : "Идеальный профиль найден")
-            : (mode == ProfileCheckMode.Accurate ? "Точная проверка завершена" : "Найден лучший профиль");
+        string title;
+        string primaryBtn;
+        if (bestResult == null)
+        {
+            title = "Преимущество не выявлено";
+            primaryBtn = "Готово";
+        }
+        else
+        {
+            title = bestResult.IsPerfect
+                ? (mode == ProfileCheckMode.Accurate ? "Точная проверка завершена" : "Идеальный профиль найден")
+                : (mode == ProfileCheckMode.Accurate ? "Точная проверка завершена" : "Найден лучший профиль");
+            primaryBtn = "Применить лучший";
+        }
 
-        // Two buttons only: "Apply best" (Primary) and optionally "Check more accurately" (Tertiary).
+        // Two buttons only: "Apply best" / "Готово" (Primary) and optionally "Check more accurately" (Tertiary).
         // "Keep old" is removed. X/close fires the Secondary action (empty text = hidden button)
         // which maps to OverlayResult.Secondary and triggers the restore path.
-        string primaryBtn = "Применить лучший";
         string? tertiaryBtn = (mode == ProfileCheckMode.Fast) ? "Проверить точнее" : null;
 
         var tcs = new TaskCompletionSource<OverlayResult>();
@@ -5099,8 +6117,30 @@ public partial class MainWindow : Window
         _currentComparisonSortCol = ComparisonSortColumn.Status;
         _currentComparisonSortDir = ComparisonSortDirection.Descending;
         _currentComparisonVpnWarning = false;
+        _selectedComparisonProfile = null;
 
-        ShowOverlay("Сравнение профилей", "", "Назад", "", onBack ?? (() => {}));
+        ShowOverlay("Сравнение профилей", "", "Применить профиль", "Назад", async () => {
+            if (!string.IsNullOrEmpty(_selectedComparisonProfile))
+            {
+                var target = HomeProfileComboBox.Items.Cast<ZapretProfileInfo>().FirstOrDefault(p => p.FileName == _selectedComparisonProfile);
+                if (target != null)
+                {
+                    if (target.FileName == _lastAppliedProfile) return;
+                    if (target.FileName == "service.bat") return;
+
+                    OverlayPrimaryButton!.IsEnabled = false;
+                    OverlayPrimaryButton.Content = "Применение...";
+
+                    try {
+                        await ApplyProfileCoreAsync(target, "Сравнение");
+                        ClearOverlayState();
+                    } catch {
+                        OverlayPrimaryButton.Content = "Повторить";
+                        OverlayPrimaryButton.IsEnabled = true;
+                    }
+                }
+            }
+        }, onBack ?? (() => {}));
 
         if (OverlayCard != null) {
             OverlayCard.Width = 800;
@@ -5118,20 +6158,59 @@ public partial class MainWindow : Window
             OverlayComparisonHeaderContainer.Visibility = Visibility.Visible;
         }
 
+        double btnWidth = 200;
+        double btnHeight = 44;
+        double btnMargin = 6;
+
+        if (OverlayStandardButtons != null)
+        {
+            OverlayStandardButtons.Orientation = System.Windows.Controls.Orientation.Horizontal;
+            OverlayStandardButtons.HorizontalAlignment = System.Windows.HorizontalAlignment.Center;
+            OverlayStandardButtons.Margin = new Thickness(0, 14, 0, 0);
+        }
+
+        if (OverlaySecondaryButton != null)
+        {
+            OverlaySecondaryButton.Margin = new Thickness(btnMargin, 0, btnMargin, 0);
+            OverlaySecondaryButton.Padding = new Thickness(0);
+            OverlaySecondaryButton.Height = btnHeight;
+            OverlaySecondaryButton.FontSize = 14;
+            OverlaySecondaryButton.Width = btnWidth;
+            OverlaySecondaryButton.Visibility = Visibility.Visible;
+            OverlaySecondaryButton.HorizontalAlignment = System.Windows.HorizontalAlignment.Center;
+        }
+
         if (OverlayPrimaryButton != null) {
-            OverlayPrimaryButton.HorizontalAlignment = System.Windows.HorizontalAlignment.Center;
+            OverlayPrimaryButton.Margin = new Thickness(btnMargin, 0, btnMargin, 0);
             OverlayPrimaryButton.Padding = new Thickness(0);
-            OverlayPrimaryButton.Width = 200;
-            OverlayPrimaryButton.Height = 44;
-            OverlayPrimaryButton.Margin = new Thickness(0, 14, 0, 0);
+            OverlayPrimaryButton.Height = btnHeight;
+            OverlayPrimaryButton.FontSize = 14;
+            OverlayPrimaryButton.Width = btnWidth;
+            OverlayPrimaryButton.Visibility = Visibility.Visible;
+            OverlayPrimaryButton.HorizontalAlignment = System.Windows.HorizontalAlignment.Center;
+        }
+
+        if (OverlayTertiaryButton != null)
+        {
+            OverlayTertiaryButton.Visibility = Visibility.Collapsed;
         }
 
         RenderComparisonOverlayContent();
     }
 
+    private long GetMeasuredRankingScore(ProfileCheckResult r)
+    {
+        long score = 0;
+        if (r.IsPerfect) score += 10000000;
+        score += r.TotalScore * 10000;
+        score += r.SuccessCount;
+        return score;
+    }
+
     private int GetComparisonStatusRank(ProfileCheckResult p, ProfileCheckResult? trueWinner)
     {
-        if (p == trueWinner) return 4;
+        if (p.IsWinner) return 5;
+        if (p.IsTie) return 4;
         if (p.IsPerfect) return 3;
         if (p.IsPartial) return 2;
         return 1;
@@ -5386,6 +6465,7 @@ public partial class MainWindow : Window
             bool isLast = (rowIndex == topProfiles.Count - 1);
             rowIndex++;
 
+            bool isSelected = (_selectedComparisonProfile == p.ProfileName);
             bool isRowWinner = (p == trueWinner);
 
             var border = new Border
@@ -5401,16 +6481,81 @@ public partial class MainWindow : Window
                 Margin = new Thickness(0, 0, 0, isLast ? 0 : ComparisonRowGap)
             };
 
-            if (isRowWinner) {
-                border.SetResourceReference(Border.BackgroundProperty, "ProfileBestRowBackgroundBrush");
-                border.SetResourceReference(Border.BorderBrushProperty, "ProfileBestRowBorderBrush");
-            } else {
-                border.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
-                border.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
+            bool isHovered = false;
+            bool isPressed = false;
+
+            void UpdateRowVisuals()
+            {
+                if (isPressed)
+                {
+                    border.SetResourceReference(Border.BackgroundProperty, "BorderBrush");
+                    border.SetResourceReference(Border.BorderBrushProperty, isSelected ? "PrimaryBrush" : "BorderBrush");
+                }
+                else if (isSelected)
+                {
+                    border.SetResourceReference(Border.BackgroundProperty, "RowHoverBrush");
+                    border.SetResourceReference(Border.BorderBrushProperty, "PrimaryBrush");
+                }
+                else if (isHovered)
+                {
+                    border.SetResourceReference(Border.BackgroundProperty, "NavHoverBgBrush");
+                    border.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
+                }
+                else
+                {
+                    border.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
+                    border.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
+                }
             }
+
+            border.MouseEnter += (s, e) =>
+            {
+                isHovered = true;
+                border.Cursor = System.Windows.Input.Cursors.Hand;
+                UpdateRowVisuals();
+            };
+
+            border.MouseLeave += (s, e) =>
+            {
+                isHovered = false;
+                isPressed = false;
+                border.Cursor = System.Windows.Input.Cursors.Arrow;
+                UpdateRowVisuals();
+            };
+
+            border.MouseLeftButtonDown += (s, e) =>
+            {
+                isPressed = true;
+                border.CaptureMouse();
+                UpdateRowVisuals();
+            };
+
+            border.MouseLeftButtonUp += (s, e) =>
+            {
+                if (isPressed)
+                {
+                    isPressed = false;
+                    border.ReleaseMouseCapture();
+                    UpdateRowVisuals();
+                    _selectedComparisonProfile = isSelected ? null : p.ProfileName;
+                    RenderComparisonOverlayContent();
+                }
+            };
+
+            border.LostMouseCapture += (s, e) =>
+            {
+                isPressed = false;
+                UpdateRowVisuals();
+            };
+
+            UpdateRowVisuals();
 
             var grid = new Grid();
             ApplyComparisonColumns(grid, includeScrollbarGutter: false);
+
+            var nameGrid = new Grid { VerticalAlignment = VerticalAlignment.Center };
+            nameGrid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            nameGrid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = GridLength.Auto });
 
             var nameText = new TextBlock
             {
@@ -5422,7 +6567,35 @@ public partial class MainWindow : Window
             };
             nameText.SetResourceReference(TextBlock.ForegroundProperty, "TextPrimaryBrush");
             Grid.SetColumn(nameText, 0);
-            grid.Children.Add(nameText);
+            nameGrid.Children.Add(nameText);
+
+            if (p.ProfileName == _lastAppliedProfile)
+            {
+                var currentBadge = new Border
+                {
+                    CornerRadius = new CornerRadius(8),
+                    Padding = new Thickness(10, 3, 10, 3),
+                    Margin = new Thickness(6, 0, 0, 0),
+                    VerticalAlignment = VerticalAlignment.Center,
+                    BorderThickness = new Thickness(0)
+                };
+                currentBadge.SetResourceReference(Border.BackgroundProperty, "VersionBadgeBackgroundBrush");
+
+                var currentText = new TextBlock
+                {
+                    Text = "Текущий",
+                    FontSize = 12,
+                    FontWeight = FontWeights.SemiBold
+                };
+                currentText.SetResourceReference(TextBlock.ForegroundProperty, "VersionBadgeTextBrush");
+                currentBadge.Child = currentText;
+
+                Grid.SetColumn(currentBadge, 1);
+                nameGrid.Children.Add(currentBadge);
+            }
+
+            Grid.SetColumn(nameGrid, 0);
+            grid.Children.Add(nameGrid);
 
             int ytVal = p.YouTubeScore * 5;
             var ytText = new TextBlock
@@ -5490,10 +6663,9 @@ public partial class MainWindow : Window
                 VerticalAlignment = VerticalAlignment.Center
             };
 
-            string statusTextStr = "Не работает";
-            if (isRowWinner) statusTextStr = "Лучший";
-            else if (p.IsPerfect) statusTextStr = "Работает";
-            else if (p.IsPartial) statusTextStr = "Частично";
+            string statusTextStr = isRowWinner
+                ? "Лучший"
+                : p.DisplayStatusRu;
 
             var statusText = new TextBlock
             {
@@ -5509,6 +6681,7 @@ public partial class MainWindow : Window
             };
 
             if (isRowWinner) statusBadge.SetResourceReference(Border.BackgroundProperty, "PrimaryBrush");
+            else if (p.IsTie) statusBadge.SetResourceReference(Border.BackgroundProperty, "IndigoBrush");
             else if (p.IsPerfect) statusBadge.SetResourceReference(Border.BackgroundProperty, "StatusOnBrush");
             else if (p.IsPartial) statusBadge.SetResourceReference(Border.BackgroundProperty, "WarningBrush");
             else statusBadge.SetResourceReference(Border.BackgroundProperty, "DangerBrush");
@@ -5527,6 +6700,29 @@ public partial class MainWindow : Window
         if (OverlayComparisonScroll != null)
         {
             OverlayComparisonScroll.ScrollToTop();
+        }
+
+        if (OverlayPrimaryButton != null && OverlayPrimaryButton.Content != null)
+        {
+            string contentStr = OverlayPrimaryButton.Content.ToString() ?? "";
+            if (contentStr != "Применение..." && contentStr != "Повторить")
+            {
+                if (string.IsNullOrEmpty(_selectedComparisonProfile))
+                {
+                    OverlayPrimaryButton.IsEnabled = false;
+                    OverlayPrimaryButton.Content = "Применить профиль";
+                }
+                else if (_selectedComparisonProfile == _lastAppliedProfile || _selectedComparisonProfile == "service.bat")
+                {
+                    OverlayPrimaryButton.IsEnabled = false;
+                    OverlayPrimaryButton.Content = "Уже выбран";
+                }
+                else
+                {
+                    OverlayPrimaryButton.IsEnabled = true;
+                    OverlayPrimaryButton.Content = "Применить профиль";
+                }
+            }
         }
     }
 
@@ -5550,86 +6746,79 @@ public partial class MainWindow : Window
         }
 
         string etaText = "";
+        string dynamicText = "";
+
         int completedCount = results.Count;
         int remainingCount = totalCount - completedCount;
 
-        if (percent >= 100)
+        if (percent >= 90)
         {
             etaText = "";
-        }
-        else if (remainingCount <= 2 && completedCount > 0)
-        {
-            etaText = " — Почти готово";
-        }
-        else if (completedCount < 2)
-        {
-            etaText = " — Оцениваем время...";
+            if (percent < 100)
+            {
+                dynamicText = "Восстанавливаем исходный профиль…";
+            }
         }
         else
         {
-            double avgMs = results.Average(r => r.CheckDuration.TotalMilliseconds);
-            double estRemainingMs = avgMs * remainingCount;
-
-            if (estRemainingMs < 60000)
+            if (completedCount < 2)
             {
-                etaText = " — Осталось меньше минуты";
-            }
-            else if (estRemainingMs < 120000)
-            {
-                etaText = " — Осталось примерно 1–2 мин.";
+                etaText = " — Оцениваем время…";
+                dynamicText = "Оцениваем время…";
             }
             else
             {
-                int minMinutes = (int)(estRemainingMs / 60000);
-                int maxMinutes = minMinutes + 2;
-                etaText = $" — Осталось примерно {minMinutes}–{maxMinutes} мин.";
+                double avgMs = results.Average(r => r.CheckDuration.TotalMilliseconds);
+                double estRemainingMs = avgMs * remainingCount;
+                double estSeconds = estRemainingMs / 1000.0;
+                string fullTooltip;
+
+                if (estSeconds <= 15)
+                {
+                    etaText = " — Осталось несколько секунд";
+                    dynamicText = "Осталось несколько секунд";
+                    fullTooltip = "Осталось несколько секунд";
+                }
+                else if (estSeconds < 60)
+                {
+                    string sec = $"{(int)Math.Round(estSeconds)} сек";
+                    etaText = $" — Осталось ~ {sec}";
+                    dynamicText = $"Осталось ~ {sec}";
+                    fullTooltip = $"Осталось ~ {sec}";
+                }
+                else
+                {
+                    int mins = (int)(estSeconds / 60);
+                    int secs = (int)Math.Round(estSeconds % 60);
+                    string timeStr = secs > 0 ? $"{mins} мин {secs} сек" : $"{mins} мин";
+                    etaText = $" — Осталось ~ {timeStr}";
+                    dynamicText = $"Осталось ~ {timeStr}";
+                    fullTooltip = $"Осталось ~ {timeStr}";
+                }
+
+                if (LeftProfileCheckingTimeText != null)
+                {
+                    LeftProfileCheckingTimeText.ToolTip = fullTooltip;
+                }
             }
         }
 
         InstallStepText.Text = step + etaText;
 
-        // Dynamic helper text for HeroHelperText
         if (_autopickStartTime.HasValue)
         {
-            double elapsed = (DateTime.Now - _autopickStartTime.Value).TotalSeconds;
-            string dynamicText;
-            if (percent < 5 || elapsed < 5)
-            {
-                dynamicText = "Оцениваем время…";
-            }
-            else
-            {
-                double remaining = elapsed * (100.0 - percent) / percent;
-                if (remaining <= 20)
-                {
-                    dynamicText = "Осталось несколько секунд";
-                }
-                else if (remaining <= 60)
-                {
-                    dynamicText = "Осталось меньше минуты";
-                }
-                else if (remaining <= 120)
-                {
-                    dynamicText = "Осталось примерно 1–2 мин";
-                }
-                else if (remaining <= 180)
-                {
-                    dynamicText = "Осталось примерно 2–3 мин";
-                }
-                else
-                {
-                    int minutes = (int)Math.Round(remaining / 60.0);
-                    if (minutes < 3) minutes = 3;
-                    dynamicText = $"Осталось примерно {minutes} мин";
-                }
-            }
             HeroHelperText.Text = "Ищем лучший профиль";
             _lastHelperText = "Ищем лучший профиль";
-            UpdateLeftProfileBusyDetails(etaText: dynamicText);
+            UpdateLeftProfileBusyDetails(etaText: percent >= 100 ? "" : dynamicText);
+            if (percent < 100 && LeftProfileCheckingTimeText != null)
+            {
+                LeftProfileCheckingTimeText.ToolTip = dynamicText.Contains("Оцениваем время") ? null : LeftProfileCheckingTimeText.ToolTip;
+            }
         }
         if (percent >= 100)
         {
             UpdateLeftProfileBusyDetails(etaText: "");
+            if (LeftProfileCheckingTimeText != null) LeftProfileCheckingTimeText.ToolTip = null;
         }
     }
 
@@ -5710,10 +6899,6 @@ public partial class MainWindow : Window
         SetLeftProfileBusyState(false);
         UpdateLeftProfileBusyDetails("", "Оцениваем время…");
 
-        _isWizardRunning = false;
-        _autopickStartTime = null;
-        UpdateConnectionDiagnosticSummary();
-
         AppLogger.Info($"Восстановление состояния: {profile ?? "null"}, был запущен={wasRunning}");
         Settings.SelectedProfile = profile ?? "";
         SafeSaveSettings();
@@ -5736,6 +6921,11 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             AppLogger.Error($"Ошибка при восстановлении исходного состояния службы: {ex.Message}");
+        }
+
+        if (profile != null)
+        {
+            SyncProfileComboBoxes(profile);
         }
     }
 
@@ -5764,38 +6954,66 @@ public partial class MainWindow : Window
         List<string> errorsList = new();
         int totalSuccessCount = 0;
         int totalProbesCount = urls.Length * probesCount;
+        int[] urlSuccessCounts = new int[urls.Length];
+
+        async Task<(int index, bool success, string? error)> ExecuteProbeAsync(string url, int urlIndex, int attempt)
+        {
+            try
+            {
+                using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
+                cts.CancelAfter(timeoutMs);
+                using var client = GitHubReleaseService.CreateHttpClient();
+                var response = await client.GetAsync(url, cts.Token);
+                if (response.IsSuccessStatusCode)
+                {
+                    return (urlIndex, true, null);
+                }
+                else
+                {
+                    return (urlIndex, false, $"{name} url {urlIndex + 1} probe {attempt + 1} failed: {response.StatusCode}");
+                }
+            }
+            catch (OperationCanceledException) when (!token.IsCancellationRequested)
+            {
+                return (urlIndex, false, $"{name} url {urlIndex + 1} probe {attempt + 1} failed: Timeout");
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return (urlIndex, false, $"{name} url {urlIndex + 1} probe {attempt + 1} error: {ex.Message}");
+            }
+        }
+
+        for (int p = 0; p < probesCount; p++)
+        {
+            var tasks = new Task<(int index, bool success, string? error)>[urls.Length];
+            for (int i = 0; i < urls.Length; i++)
+            {
+                tasks[i] = ExecuteProbeAsync(urls[i], i, p);
+            }
+
+            var probeResults = await Task.WhenAll(tasks);
+
+            foreach (var r in probeResults.OrderBy(x => x.index))
+            {
+                if (r.success)
+                {
+                    urlSuccessCounts[r.index]++;
+                    totalSuccessCount++;
+                    anySuccess = true;
+                }
+                else if (r.error != null)
+                {
+                    errorsList.Add(r.error);
+                }
+            }
+        }
 
         for (int i = 0; i < urls.Length; i++)
         {
-            int urlSuccessCount = 0;
-            for (int p = 0; p < probesCount; p++)
+            if (urlSuccessCounts[i] > 0)
             {
-                try
-                {
-                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
-                    cts.CancelAfter(timeoutMs);
-                    using var client = GitHubReleaseService.CreateHttpClient();
-                    var response = await client.GetAsync(urls[i], cts.Token);
-                    if (response.IsSuccessStatusCode)
-                    {
-                        urlSuccessCount++;
-                        totalSuccessCount++;
-                        anySuccess = true;
-                    }
-                    else
-                    {
-                        errorsList.Add($"{name} url {i+1} probe {p+1} failed: {response.StatusCode}");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    errorsList.Add($"{name} url {i+1} probe {p+1} error: {ex.Message}");
-                }
-            }
-
-            if (urlSuccessCount > 0)
-            {
-                double ratio = (double)urlSuccessCount / probesCount;
+                double ratio = (double)urlSuccessCounts[i] / probesCount;
                 totalWeightedScore += (int)(scores[i] * ratio);
             }
         }
@@ -5804,7 +7022,14 @@ public partial class MainWindow : Window
     }
 
     private void FixAllButton_Click(object sender, RoutedEventArgs e)
-        => TriggerFixAll();
+    {
+        if (_isWizardRunning)
+        {
+            AppLogger.Info("Blocked FixAllButton_Click while auto-pick is active.");
+            return;
+        }
+        TriggerFixAll();
+    }
 
     private async void TriggerFixAll()
     {
@@ -6053,6 +7278,11 @@ public partial class MainWindow : Window
 
     private async void ReinstallServiceButton_Click(object sender, RoutedEventArgs e)
     {
+        if (_isWizardRunning)
+        {
+            AppLogger.Info("Blocked ReinstallServiceButton_Click while auto-pick is active.");
+            return;
+        }
         AppLogger.Info("Запрошена переустановка службы.");
 
         if (!EnsureAdmin())
@@ -7614,10 +8844,8 @@ public partial class MainWindow : Window
         DiagTitleText.SetResourceReference(TextBlock.ForegroundProperty, "PrimaryBrush");
         DiagDescText.Text = "Подбираем профиль для YouTube и Discord.";
 
-        YouTubeStatusText.Text = "Проверяется…";
-        YouTubeStatusText.SetResourceReference(TextBlock.ForegroundProperty, "PrimaryBrush");
-        DiscordStatusText.Text = "Проверяется…";
-        DiscordStatusText.SetResourceReference(TextBlock.ForegroundProperty, "PrimaryBrush");
+        if (YouTubeStatusText != null) YouTubeStatusText.Visibility = Visibility.Collapsed;
+        if (DiscordStatusText != null) DiscordStatusText.Visibility = Visibility.Collapsed;
 
         if (YouTubeQualityBadge != null) YouTubeQualityBadge.Visibility = Visibility.Collapsed;
         if (DiscordQualityBadge != null) DiscordQualityBadge.Visibility = Visibility.Collapsed;
@@ -7751,7 +8979,7 @@ public partial class MainWindow : Window
             if (Path.GetPathRoot(fullPath) == fullPath) return false;
 
             // 4. Must not be app directory (where exe is)
-            string appDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location) ?? "";
+            string appDir = System.AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             if (fullPath.StartsWith(appDir, StringComparison.OrdinalIgnoreCase)) return false;
 
             // 5. Must not be current application base or working directory
@@ -8239,7 +9467,11 @@ public partial class MainWindow : Window
 
             try
             {
-                var profiles = _profileService.GetAvailableProfiles();
+                var profiles = _profileService.GetAvailableProfiles()
+                    .OrderBy(p => GetProfileSortKey(p.FileName).family)
+                    .ThenBy(p => GetProfileSortKey(p.FileName).altNum)
+                    .ThenBy(p => GetProfileSortKey(p.FileName).name)
+                    .ToList();
                 if (profiles.Count == 0)
                 {
                     var noneItem = CreateMenuItem("Профили не найдены", () => { }, height: 28);
