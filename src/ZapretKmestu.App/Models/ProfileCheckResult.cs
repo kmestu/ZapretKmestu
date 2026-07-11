@@ -26,13 +26,17 @@ public class ProfileCheckResult
 
     // Helper properties for UI comparison
     public bool IsWinner { get; set; }
+    public bool IsTie { get; set; }
+    public bool WasConfirmationChecked { get; set; }
     public string CheckDurationText => CheckDuration.TotalSeconds < 1 ? "< 1с" : $"{(int)CheckDuration.TotalSeconds}с";
-    public string DisplayStatus => (YouTubeAvailable && DiscordAvailable) ? "Works" : (YouTubeAvailable || DiscordAvailable) ? "Partial" : "Failed";
+    public string DisplayStatus => IsWinner ? "Winner" : IsTie ? "Tie" : (YouTubeAvailable && DiscordAvailable) ? "Works" : (YouTubeAvailable || DiscordAvailable) ? "Partial" : "Failed";
 
     public string DisplayStatusRu =>
+        IsWinner ? "Лучший" :
+        IsTie ? "Отлично" :
         (YouTubeAvailable && DiscordAvailable) ? "Работает" :
         (YouTubeAvailable || DiscordAvailable) ? "Частично" :
-        "Не работает";
+        "Не подходит";
 
     public string DisplayProfileName =>
         ProfileName.EndsWith(".bat", StringComparison.OrdinalIgnoreCase)
