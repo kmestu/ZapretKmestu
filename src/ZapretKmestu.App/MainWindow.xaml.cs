@@ -1516,7 +1516,7 @@ public partial class MainWindow : Window
         string[] parts = v.Split(new[] { '-' }, 2);
         string versionPart = parts[0];
 
-        if (Version.TryParse(versionPart, out Version parsedVersion))
+        if (Version.TryParse(versionPart, out Version? parsedVersion))
         {
             int major = parsedVersion.Major >= 0 ? parsedVersion.Major : 0;
             int minor = parsedVersion.Minor >= 0 ? parsedVersion.Minor : 0;
